@@ -2776,9 +2776,16 @@ install_liberosafety_env() {
     uv pip install numpy numba scipy pillow opencv-python "mujoco==3.3.7"
     uv pip install -e "${source_root}/third_party/robosuite-1.4" --no-deps
     uv pip install -e "${source_root}" --no-deps
+    # The upstream checkout uses ``libero/`` as a PEP 420 namespace package,
+    # but its setup.py calls find_packages(), which produces an empty editable
+    # mapping because that outer directory has no __init__.py.  Keep the
+    # checkout importable without modifying the upstream package layout.
+    local site_packages
+    site_packages=$(python -c 'import site; print(site.getsitepackages()[0])')
+    printf '%s\n' "$source_root" > "${site_packages}/libero_safety_source.pth"
     # bddl 1.0.1 imports future.utils at runtime but does not declare the
     # dependency in its package metadata.
-    uv pip install "bddl==1.0.1" future easydict "imageio[ffmpeg]" scikit-image usd-core wand matplotlib
+    uv pip install "bddl==1.0.1" future easydict "imageio[ffmpeg]" scikit-image usd-core wand matplotlib termcolor
 
     local config_root="${VIRTUAL_ENV}/share/libero-safety"
     mkdir -p "$config_root"

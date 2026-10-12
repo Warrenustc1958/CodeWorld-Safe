@@ -2,6 +2,9 @@
 # Keep these pins to avoid known compatibility breakages:
 # - openpi pins jax==0.5.3; orbax-checkpoint==0.11.13 imports
 #   jax.experimental.layout.DeviceLocalLayout, which was removed in jax>=0.7.0.
+# - NumPy is pinned below 2 by rlinf-openpi; PyArrow 26 wheels require NumPy 2.
+#   Datasets 3.6 only requires PyArrow >=15, so 20.0.0 is compatible with both.
 jax[cuda12]==0.5.3
 orbax-checkpoint==0.11.13
+pyarrow==20.0.0
 tyro==1.0.13
