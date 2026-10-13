@@ -29,6 +29,10 @@ from rlinf.envs.sim.libero.counterfactual_strategy import (
 )
 
 TARGET_QUADRANTS = frozenset({"Q2", "Q4"})
+ROOT_QUADRANTS = frozenset({"Q1", "Q3"})
+# A perturbation cannot turn a failed root into a success it never reached, so
+# Q3 roots only search for unsafe failures.
+Q3_ROOT_TARGETS = frozenset({"Q4"})
 
 Hazards = tuple[tuple[str, np.ndarray], ...]
 
@@ -65,11 +69,13 @@ class CounterfactualBranch:
     hazard_key: str | None = None
     hazard_pos: np.ndarray | None = None
     hazards: Hazards = ()
+    root_quadrant: str = "Q1"
 
     def metadata(self) -> dict[str, Any]:
         """Return JSON-compatible branch metadata for the episode auditor."""
         return {
             "root_episode_id": self.root_episode_id,
+            "root_quadrant": self.root_quadrant,
             "branch_id": self.branch_id,
             "branch_timestep": self.root_timestep,
             "alpha": self.alpha,
@@ -97,7 +103,13 @@ class _PerturbationPlan:
 
 
 class CounterfactualBranchCollector:
-    """Search Q2 and Q4 branches from a Q1 root trajectory.
+    """Search Q2 and Q4 branches from a Q1 (or optionally Q3) root trajectory.
+
+    ``root_quadrants`` selects which root outcomes start a search. A Q3 root
+    (horizon timeout, no success, no violation) can only produce Q3/Q4 under a
+    perturbation, so its search targets ``target_quadrants & {Q4}``. This is
+    what lets tasks without any Q1 root (e.g. the affordance fork task) still
+    yield unsafe branches.
 
     The collector owns only branch selection and perturbation state. The caller
     remains responsible for saving/restoring the simulator, executing actions,
@@ -122,6 +134,7 @@ class CounterfactualBranchCollector:
         action_dimensions: tuple[int, ...] = (0, 1, 2, 3, 4, 5),
         target_quadrants: frozenset[str] = TARGET_QUADRANTS,
         strategy: BranchStrategy = LEGACY_STRATEGY,
+        root_quadrants: frozenset[str] = frozenset({"Q1"}),
     ) -> None:
         alpha_min, alpha_max = map(float, perturbation_range)
         if num_envs < 1:
@@ -136,6 +149,11 @@ class CounterfactualBranchCollector:
             raise ValueError("action_dimensions must not be empty")
         if not target_quadrants or not target_quadrants <= TARGET_QUADRANTS:
             raise ValueError("target_quadrants must be a non-empty subset of Q2/Q4")
+        root_quadrants = frozenset(str(value).upper() for value in root_quadrants)
+        if not root_quadrants or not root_quadrants <= ROOT_QUADRANTS:
+            raise ValueError("root_quadrants must be a non-empty subset of Q1/Q3")
+        if "Q3" in root_quadrants and not (target_quadrants & Q3_ROOT_TARGETS):
+            raise ValueError("Q3 roots require Q4 in target_quadrants")
 
         self.num_envs = int(num_envs)
         self.risk_window_steps = int(risk_window_steps)
@@ -143,6 +161,7 @@ class CounterfactualBranchCollector:
         self.perturbation_range = (alpha_min, alpha_max)
         self.action_dimensions = tuple(int(index) for index in action_dimensions)
         self.target_quadrants = frozenset(target_quadrants)
+        self.root_quadrants = root_quadrants
         seed_sequence = np.random.SeedSequence([int(seed), int(process_id)])
         self._rngs = [
             np.random.default_rng(child) for child in seed_sequence.spawn(self.num_envs)
@@ -162,6 +181,12 @@ class CounterfactualBranchCollector:
             None
         ] * self.num_envs
         self._plans: list[_PerturbationPlan | None] = [None] * self.num_envs
+        self._root_quadrants: list[str] = ["Q1"] * self.num_envs
+        self._search_targets = [self.target_quadrants] * self.num_envs
+
+    def accepts_root(self, quadrant: str) -> bool:
+        """Return whether a root ending in ``quadrant`` starts a search."""
+        return str(quadrant).upper() in self.root_quadrants
 
     def _history_length(self, strategy: BranchStrategy) -> int:
         if strategy.history_steps is None:
@@ -194,6 +219,8 @@ class CounterfactualBranchCollector:
         self._active_branches[env_idx] = None
         self._pending_perturbed_actions[env_idx] = None
         self._plans[env_idx] = None
+        self._root_quadrants[env_idx] = "Q1"
+        self._search_targets[env_idx] = self.target_quadrants
 
     def set_root_episode_id(self, env_idx: int, episode_id: str) -> None:
         """Bind the audit record created at root reset to this search."""
@@ -248,10 +275,25 @@ class CounterfactualBranchCollector:
         )
 
     def begin_search(
-        self, env_idx: int, *, root_episode_id: str | None = None
+        self,
+        env_idx: int,
+        *,
+        root_episode_id: str | None = None,
+        root_quadrant: str = "Q1",
     ) -> CounterfactualBranch | None:
-        """Begin branching after the recorded root is confirmed as Q1."""
+        """Begin branching after the recorded root ended in an accepted quadrant."""
         self._check_env_idx(env_idx)
+        root_quadrant = str(root_quadrant).upper()
+        if root_quadrant not in self.root_quadrants:
+            raise ValueError(
+                f"root quadrant {root_quadrant!r} is not in {sorted(self.root_quadrants)}"
+            )
+        self._root_quadrants[env_idx] = root_quadrant
+        self._search_targets[env_idx] = (
+            self.target_quadrants & Q3_ROOT_TARGETS
+            if root_quadrant == "Q3"
+            else self.target_quadrants
+        )
         if not self._histories[env_idx]:
             self._phases[env_idx] = "finished"
             return None
@@ -324,7 +366,7 @@ class CounterfactualBranchCollector:
         self._pending_perturbed_actions[env_idx] = None
         self._plans[env_idx] = None
         if (
-            self._found_quadrants[env_idx] >= self.target_quadrants
+            self._found_quadrants[env_idx] >= self._search_targets[env_idx]
             or self._branch_counts[env_idx] >= self.max_branches_per_root
         ):
             self._phases[env_idx] = "finished"
@@ -466,6 +508,7 @@ class CounterfactualBranchCollector:
             hazard_key=hazard_key,
             hazard_pos=None if hazard_pos is None else hazard_pos.copy(),
             hazards=snapshot.hazards,
+            root_quadrant=self._root_quadrants[env_idx],
         )
         self._active_branches[env_idx] = branch
         self._pending_perturbed_actions[env_idx] = perturbed.copy()

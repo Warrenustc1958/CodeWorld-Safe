@@ -94,11 +94,80 @@ def test_branch_search_retries_until_q2_and_q4_are_found():
         ({"max_branches_per_root": 0}, "max_branches_per_root"),
         ({"perturbation_range": (-0.1, 0.5)}, "perturbation_range"),
         ({"target_quadrants": frozenset({"Q1"})}, "target_quadrants"),
+        ({"root_quadrants": frozenset({"Q2"})}, "root_quadrants"),
+        ({"root_quadrants": frozenset()}, "root_quadrants"),
+        (
+            {
+                "root_quadrants": frozenset({"Q1", "Q3"}),
+                "target_quadrants": frozenset({"Q2"}),
+            },
+            "Q3 roots require Q4",
+        ),
     ],
 )
 def test_branch_collector_rejects_invalid_configuration(overrides, message):
     with pytest.raises(ValueError, match=message):
         _collector(**overrides)
+
+
+def _record_one_step(collector, env_idx=0):
+    collector.record_root_step(
+        env_idx,
+        timestep=5,
+        simulator_state={"qpos": np.array([1.0])},
+        action=np.zeros(7),
+    )
+
+
+def test_default_collector_accepts_only_q1_roots():
+    collector = _collector()
+    assert collector.accepts_root("Q1")
+    assert not collector.accepts_root("Q3")
+    _record_one_step(collector)
+    with pytest.raises(ValueError, match="root quadrant"):
+        collector.begin_search(0, root_episode_id="root", root_quadrant="Q3")
+
+
+def test_q3_root_searches_only_for_q4():
+    collector = _collector(root_quadrants=frozenset({"Q1", "Q3"}))
+    assert collector.accepts_root("Q3")
+    _record_one_step(collector)
+
+    first = collector.begin_search(0, root_episode_id="root", root_quadrant="Q3")
+    assert first is not None
+    assert first.root_quadrant == "Q3"
+    assert first.metadata()["root_quadrant"] == "Q3"
+
+    # Q2 is unreachable from a failed root; a Q3 search must stop at Q4 alone.
+    second = collector.complete_branch(0, quadrant="Q3")
+    assert second is not None
+    assert collector.complete_branch(0, quadrant="Q4") is None
+    assert not collector.is_running_branch(0)
+
+
+def test_q3_root_search_stops_at_max_branches():
+    collector = _collector(
+        root_quadrants=frozenset({"Q3"}), max_branches_per_root=2
+    )
+    _record_one_step(collector)
+    assert collector.begin_search(0, root_episode_id="r", root_quadrant="Q3")
+    assert collector.complete_branch(0, quadrant="Q3") is not None
+    assert collector.complete_branch(0, quadrant="Q3") is None
+
+
+def test_reset_root_restores_q1_search_targets():
+    collector = _collector(root_quadrants=frozenset({"Q1", "Q3"}))
+    _record_one_step(collector)
+    collector.begin_search(0, root_episode_id="r3", root_quadrant="Q3")
+    collector.reset_root(0)
+    collector.set_root_episode_id(0, "r1")
+    _record_one_step(collector)
+
+    branch = collector.begin_search(0)
+    assert branch.root_quadrant == "Q1"
+    # Q1 roots still need both Q2 and Q4 before stopping early.
+    assert collector.complete_branch(0, quadrant="Q4") is not None
+    assert collector.complete_branch(0, quadrant="Q2") is None
 
 
 def _legacy_reference(seed, process_id, history_len, action, perturbation_range):

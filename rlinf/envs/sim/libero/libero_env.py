@@ -388,6 +388,13 @@ class LiberoEnv(gym.Env):
                     str(value).upper()
                     for value in branch_cfg.get("target_quadrants", ["Q2", "Q4"])
                 ),
+                # [Q1] (default) branches only successful safe roots. Adding Q3
+                # also branches safe horizon timeouts toward Q4, for tasks whose
+                # policy rarely or never succeeds (affordance fork).
+                root_quadrants=frozenset(
+                    str(value).upper()
+                    for value in branch_cfg.get("root_quadrants", ["Q1"])
+                ),
             )
         # "legacy" (default): uniform tail branch point, one random step.
         # "auto": per-suite/task strategy from counterfactual_strategy.py.
@@ -1527,14 +1534,25 @@ class LiberoEnv(gym.Env):
 
             branch = None
             if collector.is_collecting_root(env_id):
-                is_q1 = bool(raw_goal_terminations[env_id]) and not bool(
-                    self.collision_once[env_id]
-                )
-                if is_q1:
+                safe_root = not bool(self.collision_once[env_id])
+                root_quadrant = None
+                if bool(raw_goal_terminations[env_id]) and safe_root:
+                    root_quadrant = "Q1"
+                elif (
+                    bool(truncations[env_id])
+                    and safe_root
+                    and not bool(self.raw_task_success_once[env_id])
+                ):
+                    root_quadrant = "Q3"
+                if root_quadrant is not None and collector.accepts_root(root_quadrant):
                     root_episode_id = collector.root_episode_id(env_id)
                     if root_episode_id is None:
-                        raise RuntimeError("Q1 root episode has no bound auditor id")
-                    branch = collector.begin_search(env_id)
+                        raise RuntimeError(
+                            f"{root_quadrant} root episode has no bound auditor id"
+                        )
+                    branch = collector.begin_search(
+                        env_id, root_quadrant=root_quadrant
+                    )
             elif collector.is_running_branch(env_id) and bool(
                 terminations[env_id] or truncations[env_id]
             ):
