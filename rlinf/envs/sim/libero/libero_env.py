@@ -28,9 +28,17 @@ from omegaconf.omegaconf import OmegaConf
 from rlinf.envs.sim.libero.counterfactual_branch_collector import (
     CounterfactualBranch,
     CounterfactualBranchCollector,
+    hazards_from_predicates,
+)
+from rlinf.envs.sim.libero.counterfactual_strategy import (
+    LEGACY_STRATEGY,
+    resolve_branch_strategy,
+    strategy_from_config,
 )
 from rlinf.envs.sim.libero.safety_auditor import (
     AUDIT_MODES,
+    AUX_CONSTRAINT_SOURCE,
+    AUX_SAFETY_ENV_VAR,
     LiberoSafetyEpisodeAuditor,
     detect_severe_collisions,
     select_emitted_terminations,
@@ -100,6 +108,15 @@ def _requires_libero_shadow_continuation(cfg) -> bool:
     return bool(auditor_cfg is not None and auditor_cfg.get("enabled", False)) and (
         str(auditor_cfg.get("mode", "official_eval")).lower() == "shadow_collect"
     )
+
+
+def _aux_safety_requested(cfg) -> bool:
+    """Whether ``episode_auditor.aux_safety.enabled`` is set (auditor on)."""
+    auditor_cfg = OmegaConf.select(cfg, "episode_auditor", default=None)
+    if auditor_cfg is None or not auditor_cfg.get("enabled", False):
+        return False
+    aux_cfg = auditor_cfg.get("aux_safety", None) or {}
+    return bool(aux_cfg.get("enabled", False))
 
 
 libero_type = get_libero_type()
@@ -295,6 +312,24 @@ class LiberoEnv(gym.Env):
             )
             if self.max_consecutive_violation_steps < 1:
                 raise ValueError("max_consecutive_violation_steps must be at least 1")
+        # Auxiliary predicates (wrong-part grasp, unconstrained hand contact)
+        # cover hazards the BDDL leaves unconstrained, e.g. affordance tasks.
+        # They never trigger hard stops; ``count_as_unsafe`` lets them mark an
+        # episode unsafe for quadrant labels in shadow collection.
+        self.aux_safety_enabled = _aux_safety_requested(cfg)
+        self.aux_count_as_unsafe = False
+        if self.aux_safety_enabled:
+            aux_cfg = auditor_cfg.get("aux_safety", None) or {}
+            self.aux_count_as_unsafe = bool(
+                aux_cfg.get(
+                    "count_as_unsafe", self.episode_auditor_mode == "shadow_collect"
+                )
+            )
+            if self.aux_count_as_unsafe and self.episode_auditor_mode != "shadow_collect":
+                raise ValueError(
+                    "aux_safety.count_as_unsafe changes official safety labels; "
+                    "it requires episode_auditor.mode=shadow_collect"
+                )
         self.episode_auditor = None
         if auditor_enabled:
             self.episode_auditor = LiberoSafetyEpisodeAuditor(
@@ -354,6 +389,40 @@ class LiberoEnv(gym.Env):
                     for value in branch_cfg.get("target_quadrants", ["Q2", "Q4"])
                 ),
             )
+        # "legacy" (default): uniform tail branch point, one random step.
+        # "auto": per-suite/task strategy from counterfactual_strategy.py.
+        # mapping: explicit BranchStrategy fields for every task.
+        strategy_cfg = branch_cfg.get("strategy", "legacy")
+        if OmegaConf.is_config(strategy_cfg):
+            strategy_cfg = OmegaConf.to_container(strategy_cfg, resolve=True)
+        overrides_cfg = branch_cfg.get("strategy_overrides", None) or {}
+        if OmegaConf.is_config(overrides_cfg):
+            overrides_cfg = OmegaConf.to_container(overrides_cfg, resolve=True)
+        self._branch_strategy_overrides = dict(overrides_cfg)
+        self._branch_strategy_mode = "legacy"
+        self._fixed_branch_strategy = LEGACY_STRATEGY
+        if isinstance(strategy_cfg, dict):
+            self._branch_strategy_mode = "fixed"
+            self._fixed_branch_strategy = strategy_from_config(strategy_cfg)
+        else:
+            mode = str(strategy_cfg).lower()
+            if mode not in ("legacy", "auto"):
+                raise ValueError(
+                    "counterfactual_branch.strategy must be 'legacy', 'auto' or a "
+                    f"mapping, got {strategy_cfg!r}"
+                )
+            self._branch_strategy_mode = mode
+        if (
+            self.counterfactual_branch_collector is not None
+            and self._branch_strategy_mode == "auto"
+            and str(self.cfg.task_suite_name).lower() == "affordance"
+            and not self.aux_safety_enabled
+        ):
+            logger.warning(
+                "affordance BDDL has no :constraints; without "
+                "episode_auditor.aux_safety.enabled=true branches cannot become unsafe"
+            )
+        self._hazards = [() for _ in range(self.num_envs)]
 
     def _log_evaluation_mode(self):
         """Log the LIBERO evaluation mode banner (rank 0 env worker only)."""
@@ -386,11 +455,18 @@ class LiberoEnv(gym.Env):
         env_fns = []
 
         current_type_val = get_libero_type()
+        # Auxiliary safety predicates are evaluated inside the env subprocess
+        # (venv.py), so the opt-in flag must be exported there. ``_init_env``
+        # runs before the auditor config is parsed, hence the direct select.
+        aux_flag = "1" if _aux_safety_requested(self.cfg) else "0"
 
         for env_fn_param in env_fn_params:
 
-            def env_fn(param=env_fn_param, _type_val=current_type_val):
+            def env_fn(
+                param=env_fn_param, _type_val=current_type_val, _aux_flag=aux_flag
+            ):
                 os.environ["LIBERO_TYPE"] = _type_val
+                os.environ[AUX_SAFETY_ENV_VAR] = _aux_flag
                 seed = param.pop("seed")
 
                 if _type_val in ["pro", "plus"]:
@@ -1026,22 +1102,50 @@ class LiberoEnv(gym.Env):
         }
 
     @staticmethod
-    def _constraint_violations(predicate_audits, info_lists):
-        """Return per-environment violations without collapsing predicates."""
+    def _constraint_violations(predicate_audits, info_lists, sources=("constraint",)):
+        """Return per-environment violations without collapsing predicates.
+
+        ``info["cost"]`` mirrors the official BDDL constraints only, so the
+        fallback applies only when official sources are requested.
+        """
+        sources = frozenset(sources)
+        official = "constraint" in sources
         violations = []
         for predicates, info in zip(predicate_audits, info_lists):
             if predicates:
                 violations.append(
                     any(
-                        predicate["source"] == "constraint" and bool(predicate["value"])
+                        predicate["source"] in sources and bool(predicate["value"])
                         for predicate in predicates
                     )
                 )
-            else:
+            elif official:
                 violations.append(
                     any(bool(value) for value in info.get("cost", {}).values())
                 )
+            else:
+                violations.append(False)
         return np.asarray(violations, dtype=bool)
+
+    def _update_hazards(self, predicate_audits, env_ids=None):
+        """Track the latest hazard positions per env for branch strategies."""
+        if not self.aux_safety_enabled:
+            return
+        env_ids = range(self.num_envs) if env_ids is None else env_ids
+        for env_id, predicates in zip(env_ids, predicate_audits):
+            self._hazards[env_id] = hazards_from_predicates(predicates or [])
+
+    def _resolve_branch_strategy(self, env_id):
+        if self._branch_strategy_mode == "fixed":
+            return self._fixed_branch_strategy
+        if self._branch_strategy_mode == "auto":
+            return resolve_branch_strategy(
+                str(self.cfg.task_suite_name),
+                int(self.safety_level),
+                self.task_descriptions[env_id],
+                self._branch_strategy_overrides,
+            )
+        return LEGACY_STRATEGY
 
     def _record_metrics(
         self,
@@ -1202,6 +1306,10 @@ class LiberoEnv(gym.Env):
             if self.counterfactual_branch_collector is not None:
                 self._pending_counterfactual_restores[env_id] = None
                 self.counterfactual_branch_collector.reset_root(env_id)
+                self.counterfactual_branch_collector.set_strategy(
+                    env_id, self._resolve_branch_strategy(env_id)
+                )
+            self._hazards[env_id] = ()
             if self.episode_auditor is not None:
                 self.episode_auditor.start_episode(
                     env_id,
@@ -1330,7 +1438,12 @@ class LiberoEnv(gym.Env):
         for env_id in range(self.num_envs):
             if self._pending_counterfactual_restores[env_id] is not None:
                 continue
-            perturbed_action = collector.consume_perturbed_action(env_id)
+            perturbed_action = collector.consume_perturbed_action(
+                env_id,
+                policy_action=prepared_actions[env_id],
+                eef_pos=self._current_eef_pos(env_id),
+                hazards=self._hazards[env_id],
+            )
             if perturbed_action is not None:
                 prepared_actions[env_id] = perturbed_action
 
@@ -1347,8 +1460,17 @@ class LiberoEnv(gym.Env):
                     timestep=int(self.elapsed_steps[env_id]) + 1,
                     simulator_state=snapshot,
                     action=prepared_actions[env_id],
+                    hazards=self._hazards[env_id],
+                    eef_pos=self._current_eef_pos(env_id),
                 )
         return prepared_actions
+
+    def _current_eef_pos(self, env_id: int):
+        """End-effector position of the observation the next action acts on."""
+        if self.current_raw_obs is None or self.current_raw_obs[env_id] is None:
+            return None
+        position = self.current_raw_obs[env_id].get("robot0_eef_pos")
+        return None if position is None else np.asarray(position, dtype=np.float64)
 
     def _start_counterfactual_branch(
         self,
@@ -1362,6 +1484,8 @@ class LiberoEnv(gym.Env):
         )[0]
         raw_obs[env_id] = restored
         self.current_raw_obs[env_id] = restored
+        # Hazards seen at the branch point; refreshed by the next step's audit.
+        self._hazards[env_id] = branch.hazards
         self._reset_metrics(np.asarray([env_id]))
         self.episode_auditor.start_episode(
             env_id,
@@ -1452,15 +1576,23 @@ class LiberoEnv(gym.Env):
             info.pop("_libero_safety_predicates", []) for info in info_lists
         ]
         raw_goal_terminations = np.asarray(goal_terminations, dtype=bool)
-        constraint_violations = (
+        self._update_hazards(predicate_audits)
+        official_violations = (
             self._constraint_violations(predicate_audits, info_lists)
             if self.libero_type == "safety"
             else np.zeros(self.num_envs, dtype=bool)
         )
+        constraint_violations = official_violations
+        if self.libero_type == "safety" and self.aux_count_as_unsafe:
+            # Shadow collection only: aux hazards label the episode unsafe
+            # (quadrants, metrics, audit) but never cause a hard stop.
+            constraint_violations = official_violations | self._constraint_violations(
+                predicate_audits, info_lists, sources=(AUX_CONSTRAINT_SOURCE,)
+            )
         severe_collision_terminations, self.consecutive_violation_steps = (
             detect_severe_collisions(
                 predicate_audits=predicate_audits,
-                constraint_violations=constraint_violations,
+                constraint_violations=official_violations,
                 consecutive_violation_steps=self.consecutive_violation_steps,
                 hard_stop_predicates=self.severe_collision_predicates,
                 max_consecutive_violation_steps=(self.max_consecutive_violation_steps),

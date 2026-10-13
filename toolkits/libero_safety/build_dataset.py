@@ -30,6 +30,10 @@ AUDIT_SCHEMA_VERSION = "libero_safety_episode_audit/v1"
 DATASET_SCHEMA_VERSION = "libero_safety_wan_sam_dataset/v1"
 QUADRANTS = ("Q1", "Q2", "Q3", "Q4")
 DEFAULT_RISK_HORIZONS = (1, 4, 8, 16, 32)
+# Predicate sources whose True value marks the state unsafe. "aux_constraint"
+# is emitted by shadow-collect auxiliary safety predicates (see
+# rlinf/envs/sim/libero/safety_auditor.py) and never by official evaluation.
+VIOLATION_SOURCES = frozenset({"constraint", "aux_constraint"})
 
 
 @dataclass(frozen=True)
@@ -172,6 +176,19 @@ def _stable_score(seed: int, value: str) -> int:
     return int.from_bytes(digest[:8], "big")
 
 
+def _record_field(record: dict[str, Any], key: str) -> Any:
+    """Read branch metadata from the top level or the nested episode block.
+
+    The auditor mirrors root_episode_id/branch_id/alpha/perturbation_range to
+    the top level, while branch_timestep and the perturbation vectors only live
+    under ``episode``. Older or hand-written audits may use either location.
+    """
+    value = record.get(key)
+    if value is None:
+        value = record.get("episode", {}).get(key)
+    return value
+
+
 def _split_group(episode: ValidatedEpisode, split_unit: str) -> str:
     metadata = episode.record["episode"]
     if split_unit == "task":
@@ -191,8 +208,9 @@ def _split_group(episode: ValidatedEpisode, split_unit: str) -> str:
                 str(metadata.get("trial_id")),
             ]
         )
-    source_root_id = episode.record.get("root_episode_id")
+    source_root_id = _record_field(episode.record, "root_episode_id")
     if source_root_id is None:
+        # A root episode is its own group; its branches join it below.
         return episode.episode_id
     return f"{episode.collection_id}:{source_root_id}"
 
@@ -278,10 +296,115 @@ def _predicate_definitions(trajectory: list[dict[str, Any]]) -> list[dict[str, A
     return [definitions[key] for key in sorted(definitions)]
 
 
+@dataclass(frozen=True)
+class StitchedSequence:
+    """One episode as a contiguous sequence from the root reset frame.
+
+    Root episodes map to themselves. A counterfactual branch is restored from a
+    root snapshot taken just before root step ``branch_timestep``, so its audit
+    only contains the post-branch tail. Stitching prepends root transitions
+    ``1 .. branch_timestep - 1`` so the world model sees the full history that
+    led to the branch point (Wan needs ``condition_frame_length`` context
+    frames before the chunk it predicts).
+    """
+
+    steps: list[dict[str, Any]]
+    images: np.ndarray  # [len(steps) + 1, H, W, 3]; images[-1] is the outcome
+    segments: list[str]  # per transition: "root_prefix" or "episode"
+    init_state: np.ndarray
+    root_prefix_transitions: int
+
+
+# Mean absolute uint8 difference allowed between the root frame at the branch
+# point and the branch's first frame. Restored MuJoCo states re-render with
+# ~0.02 drift; anything near this bound means the wrong root or timestep.
+BRANCH_FRAME_MATCH_TOLERANCE = 2.0
+
+
+def _is_branch(episode: ValidatedEpisode) -> bool:
+    return _record_field(episode.record, "root_episode_id") is not None
+
+
+def _root_key(episode: ValidatedEpisode) -> tuple[str, str]:
+    return (
+        episode.collection_id,
+        str(_record_field(episode.record, "root_episode_id")),
+    )
+
+
+def _load_images(episode: ValidatedEpisode) -> np.ndarray:
+    with np.load(episode.visual_path, allow_pickle=False) as sidecar:
+        return np.asarray(sidecar[episode.camera_key], dtype=np.uint8)
+
+
+def _stitch_sequence(
+    episode: ValidatedEpisode, root: ValidatedEpisode | None
+) -> StitchedSequence:
+    """Return the episode, prefixed by its root history when it is a branch."""
+    steps = list(episode.record["trajectory"])
+    images = _load_images(episode)
+    if root is None:
+        return StitchedSequence(
+            steps=steps,
+            images=images,
+            segments=["episode"] * len(steps),
+            init_state=_initial_state(episode.record),
+            root_prefix_transitions=0,
+        )
+
+    raw_branch_timestep = _record_field(episode.record, "branch_timestep")
+    if raw_branch_timestep is None:
+        raise ValueError(f"{episode.audit_path}: branch has no branch_timestep")
+    branch_timestep = int(raw_branch_timestep)
+    prefix = branch_timestep - 1
+    root_steps = root.record["trajectory"]
+    if not 0 <= prefix <= len(root_steps):
+        raise ValueError(
+            f"{episode.audit_path}: branch_timestep={branch_timestep} is outside "
+            f"root {root.episode_id} with {len(root_steps)} transitions"
+        )
+    if prefix and int(root_steps[prefix - 1]["timestep"]) != prefix:
+        raise ValueError(
+            f"{root.audit_path}: root timesteps are not contiguous 1-based; "
+            f"cannot locate branch_timestep={branch_timestep}"
+        )
+    if root.camera_key != episode.camera_key:
+        raise ValueError("root and branch must use the same camera key")
+
+    root_images = _load_images(root)
+    if root_images.shape[1:] != images.shape[1:]:
+        raise ValueError(
+            f"{episode.audit_path}: frame shape {images.shape[1:]} differs from "
+            f"root {root_images.shape[1:]}"
+        )
+    drift = float(
+        np.abs(
+            root_images[prefix].astype(np.int16) - images[0].astype(np.int16)
+        ).mean()
+    )
+    if drift > BRANCH_FRAME_MATCH_TOLERANCE:
+        raise ValueError(
+            f"{episode.audit_path}: first branch frame differs from root frame "
+            f"{prefix} by {drift:.3f} (> {BRANCH_FRAME_MATCH_TOLERANCE}); "
+            "root/branch pairing is inconsistent"
+        )
+    return StitchedSequence(
+        steps=list(root_steps[:prefix]) + steps,
+        # The restored branch frame replaces root frame `prefix`, so the
+        # sequence stays frame[t] + action[t] -> frame[t + 1] across the seam.
+        images=np.concatenate([root_images[:prefix], images], axis=0),
+        segments=["root_prefix"] * prefix + ["episode"] * len(steps),
+        init_state=_initial_state(root.record),
+        root_prefix_transitions=prefix,
+    )
+
+
 def _step_labels(
-    episode: ValidatedEpisode, risk_horizons: tuple[int, ...]
+    episode: ValidatedEpisode,
+    sequence: StitchedSequence,
+    risk_horizons: tuple[int, ...],
 ) -> list[dict[str, Any]]:
-    trajectory = episode.record["trajectory"]
+    trajectory = sequence.steps
     violation_indices = [
         index
         for index, step in enumerate(trajectory)
@@ -297,12 +420,16 @@ def _step_labels(
         active_constraints = [
             str(predicate["instance_id"])
             for predicate in step["predicates"]
-            if predicate["source"] == "constraint" and bool(predicate["value"])
+            if predicate["source"] in VIOLATION_SOURCES and bool(predicate["value"])
         ]
         labels.append(
             {
                 "episode_id": episode.episode_id,
-                "timestep": int(step["timestep"]),
+                # Timesteps are renumbered over the stitched sequence; the
+                # audit's own counter is kept in source_timestep.
+                "timestep": index + 1,
+                "source_timestep": int(step["timestep"]),
+                "segment": sequence.segments[index],
                 "action_index": index,
                 "label_alignment": "post_action_state",
                 "executed_action": step["action"],
@@ -338,31 +465,65 @@ def _step_labels(
     return labels
 
 
-def _wan_frames(episode: ValidatedEpisode, labels: list[dict[str, Any]]) -> np.ndarray:
-    trajectory = episode.record["trajectory"]
+def _wan_frames(
+    episode: ValidatedEpisode,
+    sequence: StitchedSequence,
+    labels: list[dict[str, Any]],
+) -> np.ndarray:
+    """Export T + 1 frames: every observed frame, including the outcome frame.
+
+    Frame ``t`` carries the action executed from it (``action_valid=True``).
+    The final frame shows the post-outcome state (success, violation, or
+    horizon); it has no outgoing action, so ``delta_action`` is zero and
+    ``action_valid`` is False. Consumers that slice action windows must not
+    treat that zero as a commanded action.
+    """
     instruction = str(episode.record["episode"]["instruction"])
-    init_state = _initial_state(episode.record)
-    with np.load(episode.visual_path, allow_pickle=False) as sidecar:
-        images = sidecar[episode.camera_key]
-        frames = []
-        for index, (step, label) in enumerate(zip(trajectory, labels)):
-            frames.append(
-                {
-                    "image": np.asarray(images[index], dtype=np.uint8),
-                    "delta_action": np.asarray(step["action"], dtype=np.float32),
-                    "init_ee_pose": init_state,
-                    "instruction": instruction,
-                    "episode_id": episode.episode_id,
-                    "timestep": int(step["timestep"]),
-                    "quadrant": episode.quadrant,
-                    "success": bool(episode.record["outcome"]["success"]),
-                    "unsafe": bool(episode.record["outcome"]["unsafe"]),
-                    "post_action_violation": label["post_action_violation"],
-                    "post_action_severe_collision": label[
-                        "post_action_severe_collision"
-                    ],
-                }
-            )
+    common = {
+        "init_ee_pose": sequence.init_state,
+        "instruction": instruction,
+        "episode_id": episode.episode_id,
+        "quadrant": episode.quadrant,
+        "success": bool(episode.record["outcome"]["success"]),
+        "unsafe": bool(episode.record["outcome"]["unsafe"]),
+    }
+    action_shape = np.asarray(sequence.steps[0]["action"]).shape
+    # state_violation[t]: the state shown in frame t violates a constraint,
+    # i.e. the transition that produced it did. Frame 0 is a reset/restore.
+    state_violation = [False] + [bool(item["post_action_violation"]) for item in labels]
+    frames = []
+    for index, (step, label) in enumerate(zip(sequence.steps, labels)):
+        frames.append(
+            {
+                **common,
+                "image": sequence.images[index],
+                "delta_action": np.asarray(step["action"], dtype=np.float32),
+                "action_valid": True,
+                "is_terminal": False,
+                "timestep": index + 1,
+                "segment": label["segment"],
+                "state_violation": state_violation[index],
+                # Labels of the transition leaving this frame.
+                "post_action_violation": label["post_action_violation"],
+                "post_action_severe_collision": label[
+                    "post_action_severe_collision"
+                ],
+            }
+        )
+    frames.append(
+        {
+            **common,
+            "image": sequence.images[len(sequence.steps)],
+            "delta_action": np.zeros(action_shape, dtype=np.float32),
+            "action_valid": False,
+            "is_terminal": True,
+            "timestep": len(sequence.steps) + 1,
+            "segment": sequence.segments[-1],
+            "state_violation": state_violation[-1],
+            "post_action_violation": False,
+            "post_action_severe_collision": False,
+        }
+    )
     return np.asarray(frames, dtype=object)
 
 
@@ -396,6 +557,7 @@ def build_dataset(
     risk_horizons: tuple[int, ...] = DEFAULT_RISK_HORIZONS,
     max_per_quadrant: dict[str, int] | None = None,
     min_per_quadrant: dict[str, int] | None = None,
+    stitch_branches: bool = True,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Validate, select, split, and export one unified Wan/SAM dataset."""
@@ -468,6 +630,31 @@ def build_dataset(
     if not selected:
         raise ValueError("No episodes remain after quadrant selection")
 
+    # Roots are resolved against every valid episode, not only the selected
+    # ones, so a Q2 branch can be stitched even when its Q1 root is filtered.
+    by_source_id = {
+        (item.collection_id, item.source_episode_id): item for item in valid
+    }
+    roots_by_id: dict[str, ValidatedEpisode | None] = {}
+    prefix_by_id: dict[str, int] = {}
+    for item in selected:
+        root = None
+        if stitch_branches and _is_branch(item):
+            root = by_source_id.get(_root_key(item))
+            if root is None:
+                raise ValueError(
+                    f"{item.audit_path}: root episode {_root_key(item)[1]} not "
+                    "found under the audit roots; pass the full run directory "
+                    "or use --no-stitch-branches"
+                )
+            if _is_branch(root):
+                raise ValueError(f"{item.audit_path}: root is itself a branch")
+            raw_branch_timestep = _record_field(item.record, "branch_timestep")
+            if raw_branch_timestep is None:
+                raise ValueError(f"{item.audit_path}: branch has no branch_timestep")
+            prefix_by_id[item.episode_id] = int(raw_branch_timestep) - 1
+        roots_by_id[item.episode_id] = root
+
     split_by_id = {
         item.episode_id: _assign_split(
             item, split_unit, train_fraction, val_fraction, seed
@@ -481,7 +668,17 @@ def build_dataset(
         "quadrants": list(selected_quadrants),
         "episodes_discovered": len(audit_paths),
         "episodes_selected": len(selected),
-        "transitions_selected": sum(item.num_transitions for item in selected),
+        "transitions_selected": sum(
+            item.num_transitions + prefix_by_id.get(item.episode_id, 0)
+            for item in selected
+        ),
+        "frames_selected": sum(
+            item.num_transitions + prefix_by_id.get(item.episode_id, 0) + 1
+            for item in selected
+        ),
+        "stitch_branches": stitch_branches,
+        "branches_stitched": len(prefix_by_id),
+        "frame_layout": "T+1 frames; last frame is the outcome with action_valid=False",
         "quadrant_counts": {
             quadrant: selected_counts[quadrant] for quadrant in QUADRANTS
         },
@@ -511,8 +708,10 @@ def build_dataset(
     split_indices = Counter()
     for episode in selected:
         split = split_by_id[episode.episode_id]
-        labels = _step_labels(episode, risk_horizons)
-        wan_frames = _wan_frames(episode, labels)
+        root = roots_by_id[episode.episode_id]
+        sequence = _stitch_sequence(episode, root)
+        labels = _step_labels(episode, sequence, risk_horizons)
+        wan_frames = _wan_frames(episode, sequence, labels)
         wan_name = f"traj{split_indices[split]:06d}.npy"
         split_indices[split] += 1
         wan_path = output_dir / "wan" / split / wan_name
@@ -525,8 +724,8 @@ def build_dataset(
             label["wan_path"] = str(wan_path.relative_to(output_dir))
         sam_rows[split].extend(labels)
         metadata = episode.record["episode"]
-        source_root_id = episode.record.get("root_episode_id")
-        source_branch_id = episode.record.get("branch_id")
+        source_root_id = _record_field(episode.record, "root_episode_id")
+        source_branch_id = _record_field(episode.record, "branch_id")
         episode_manifest.append(
             {
                 "episode_id": episode.episode_id,
@@ -542,10 +741,19 @@ def build_dataset(
                     if source_branch_id is not None
                     else None
                 ),
-                "alpha": episode.record.get("alpha"),
-                "perturbation_range": episode.record.get("perturbation_range"),
+                "alpha": _record_field(episode.record, "alpha"),
+                "perturbation_range": _record_field(
+                    episode.record, "perturbation_range"
+                ),
                 "branch_timestep": metadata.get("branch_timestep"),
+                "branch_strategy": metadata.get("branch_strategy"),
                 "episode_kind": metadata.get("episode_kind", "root"),
+                "stitched": root is not None,
+                "root_prefix_transitions": sequence.root_prefix_transitions,
+                "num_frames": len(wan_frames),
+                "root_audit_path": (
+                    str(root.audit_path.resolve()) if root is not None else None
+                ),
                 "split": split,
                 "quadrant": episode.quadrant,
                 "success": bool(episode.record["outcome"]["success"]),
@@ -555,16 +763,16 @@ def build_dataset(
                 "task_id": metadata.get("task_id"),
                 "trial_id": metadata.get("trial_id"),
                 "instruction": metadata.get("instruction"),
-                "num_transitions": episode.num_transitions,
+                # Stitched length; the branch-only audit length is separate.
+                "num_transitions": len(sequence.steps),
+                "episode_num_transitions": episode.num_transitions,
                 "first_violation_timestep": episode.record["outcome"].get(
                     "first_violation_timestep"
                 ),
                 "first_severe_collision_timestep": episode.record["outcome"].get(
                     "first_severe_collision_timestep"
                 ),
-                "predicate_instances": _predicate_definitions(
-                    episode.record["trajectory"]
-                ),
+                "predicate_instances": _predicate_definitions(sequence.steps),
                 "audit_path": str(episode.audit_path.resolve()),
                 "visual_path": str(episode.visual_path.resolve()),
                 "wan_path": str(wan_path.relative_to(output_dir)),
@@ -600,6 +808,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-per-quadrant", action="append", default=[])
     parser.add_argument("--min-per-quadrant", action="append", default=[])
+    parser.add_argument(
+        "--no-stitch-branches",
+        dest="stitch_branches",
+        action="store_false",
+        help="Export counterfactual branches without their root prefix.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -622,6 +836,7 @@ def main() -> None:
         min_per_quadrant=_parse_quadrant_counts(
             args.min_per_quadrant, "--min-per-quadrant"
         ),
+        stitch_branches=args.stitch_branches,
         dry_run=args.dry_run,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))

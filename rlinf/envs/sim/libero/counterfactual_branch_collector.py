@@ -23,7 +23,14 @@ from typing import Any
 
 import numpy as np
 
+from rlinf.envs.sim.libero.counterfactual_strategy import (
+    LEGACY_STRATEGY,
+    BranchStrategy,
+)
+
 TARGET_QUADRANTS = frozenset({"Q2", "Q4"})
+
+Hazards = tuple[tuple[str, np.ndarray], ...]
 
 
 @dataclass(frozen=True)
@@ -33,6 +40,10 @@ class RiskSnapshot:
     timestep: int
     simulator_state: Any
     action: np.ndarray
+    # (hazard key, world position) of violation predicates; empty when the
+    # auditor does not publish hazard positions.
+    hazards: Hazards = ()
+    eef_pos: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +59,12 @@ class CounterfactualBranch:
     original_action: np.ndarray
     perturbed_action: np.ndarray
     perturbation: np.ndarray
+    strategy: BranchStrategy = LEGACY_STRATEGY
+    perturb_steps: int = 1
+    directed: bool = False
+    hazard_key: str | None = None
+    hazard_pos: np.ndarray | None = None
+    hazards: Hazards = ()
 
     def metadata(self) -> dict[str, Any]:
         """Return JSON-compatible branch metadata for the episode auditor."""
@@ -60,15 +77,37 @@ class CounterfactualBranch:
             "original_action": self.original_action.tolist(),
             "perturbed_action": self.perturbed_action.tolist(),
             "perturbation": self.perturbation.tolist(),
+            "branch_strategy": self.strategy.name,
+            "branch_strategy_params": self.strategy.metadata(),
+            "perturb_steps": self.perturb_steps,
+            "directed": self.directed,
+            "hazard_key": self.hazard_key,
+            "hazard_pos": None
+            if self.hazard_pos is None
+            else np.asarray(self.hazard_pos).tolist(),
         }
 
 
+@dataclass
+class _PerturbationPlan:
+    """Progress of a multi-step branch perturbation."""
+
+    branch: CounterfactualBranch
+    steps_done: int = 1
+
+
 class CounterfactualBranchCollector:
-    """Search Q2 and Q4 branches from the tail of a Q1 root trajectory.
+    """Search Q2 and Q4 branches from a Q1 root trajectory.
 
     The collector owns only branch selection and perturbation state. The caller
     remains responsible for saving/restoring the simulator, executing actions,
     rolling out the policy, and writing episode audit files.
+
+    With the default (legacy) strategy a branch is one uniformly random action
+    perturbation at a uniform point of the last ``risk_window_steps`` steps.
+    Per-environment :class:`BranchStrategy` objects (``counterfactual_strategy``)
+    enable risk-weighted branch points and multi-step perturbations aimed at
+    the task's hazard.
     """
 
     def __init__(
@@ -82,6 +121,7 @@ class CounterfactualBranchCollector:
         perturbation_range: tuple[float, float] = (0.15, 1.0),
         action_dimensions: tuple[int, ...] = (0, 1, 2, 3, 4, 5),
         target_quadrants: frozenset[str] = TARGET_QUADRANTS,
+        strategy: BranchStrategy = LEGACY_STRATEGY,
     ) -> None:
         alpha_min, alpha_max = map(float, perturbation_range)
         if num_envs < 1:
@@ -107,8 +147,9 @@ class CounterfactualBranchCollector:
         self._rngs = [
             np.random.default_rng(child) for child in seed_sequence.spawn(self.num_envs)
         ]
+        self._strategies = [strategy] * self.num_envs
         self._histories = [
-            deque(maxlen=self.risk_window_steps) for _ in range(self.num_envs)
+            deque(maxlen=self._history_length(strategy)) for _ in range(self.num_envs)
         ]
         self._phases = ["root"] * self.num_envs
         self._root_episode_ids: list[str | None] = [None] * self.num_envs
@@ -120,6 +161,27 @@ class CounterfactualBranchCollector:
         self._pending_perturbed_actions: list[np.ndarray | None] = [
             None
         ] * self.num_envs
+        self._plans: list[_PerturbationPlan | None] = [None] * self.num_envs
+
+    def _history_length(self, strategy: BranchStrategy) -> int:
+        if strategy.history_steps is None:
+            return self.risk_window_steps
+        return int(strategy.history_steps)
+
+    def set_strategy(self, env_idx: int, strategy: BranchStrategy) -> None:
+        """Bind a strategy to an environment right after ``reset_root``."""
+        self._check_env_idx(env_idx)
+        if not self.is_collecting_root(env_idx) or self._histories[env_idx]:
+            raise RuntimeError("set_strategy must be called right after reset_root")
+        self._strategies[env_idx] = strategy
+        length = self._history_length(strategy)
+        if self._histories[env_idx].maxlen != length:
+            self._histories[env_idx] = deque(maxlen=length)
+
+    def strategy(self, env_idx: int) -> BranchStrategy:
+        """Return the strategy bound to an environment."""
+        self._check_env_idx(env_idx)
+        return self._strategies[env_idx]
 
     def reset_root(self, env_idx: int) -> None:
         """Start collecting snapshots for a new candidate root episode."""
@@ -131,6 +193,7 @@ class CounterfactualBranchCollector:
         self._found_quadrants[env_idx].clear()
         self._active_branches[env_idx] = None
         self._pending_perturbed_actions[env_idx] = None
+        self._plans[env_idx] = None
 
     def set_root_episode_id(self, env_idx: int, episode_id: str) -> None:
         """Bind the audit record created at root reset to this search."""
@@ -165,6 +228,8 @@ class CounterfactualBranchCollector:
         timestep: int,
         simulator_state: Any,
         action: np.ndarray,
+        hazards: Any = (),
+        eef_pos: np.ndarray | None = None,
     ) -> None:
         """Record a bounded pre-action snapshot while the root is active."""
         self._check_env_idx(env_idx)
@@ -175,6 +240,10 @@ class CounterfactualBranchCollector:
                 timestep=int(timestep),
                 simulator_state=copy.deepcopy(simulator_state),
                 action=np.asarray(action, dtype=np.float64).copy(),
+                hazards=normalize_hazards(hazards),
+                eef_pos=None
+                if eef_pos is None
+                else np.asarray(eef_pos, dtype=np.float64).copy(),
             )
         )
 
@@ -197,12 +266,48 @@ class CounterfactualBranchCollector:
         self._found_quadrants[env_idx].clear()
         return self._sample_branch(env_idx)
 
-    def consume_perturbed_action(self, env_idx: int) -> np.ndarray | None:
-        """Consume the one-shot action that starts the active branch."""
+    def consume_perturbed_action(
+        self,
+        env_idx: int,
+        *,
+        policy_action: np.ndarray | None = None,
+        eef_pos: np.ndarray | None = None,
+        hazards: Any = None,
+    ) -> np.ndarray | None:
+        """Return the next perturbed action of the active branch, if any.
+
+        The first call returns the branch's precomputed action. Multi-step
+        strategies then keep perturbing the live ``policy_action`` until
+        ``perturb_steps`` actions were replaced; directed branches re-aim at the
+        hazard's current position (``hazards``) from ``eef_pos``.
+        """
         self._check_env_idx(env_idx)
         action = self._pending_perturbed_actions[env_idx]
         self._pending_perturbed_actions[env_idx] = None
-        return None if action is None else action.copy()
+        if action is not None:
+            return action.copy()
+        plan = self._plans[env_idx]
+        if plan is None or policy_action is None:
+            return None
+        branch = plan.branch
+        hazard_pos = branch.hazard_pos
+        if hazards is not None and branch.hazard_key is not None:
+            hazard_pos = dict(normalize_hazards(hazards)).get(
+                branch.hazard_key, hazard_pos
+            )
+        perturbed = self._perturb(
+            env_idx,
+            np.asarray(policy_action, dtype=np.float64),
+            alpha=branch.alpha,
+            strategy=branch.strategy,
+            directed=branch.directed,
+            hazard_pos=hazard_pos,
+            eef_pos=eef_pos,
+        )
+        plan.steps_done += 1
+        if plan.steps_done >= branch.perturb_steps:
+            self._plans[env_idx] = None
+        return perturbed
 
     def complete_branch(
         self, env_idx: int, *, quadrant: str
@@ -217,6 +322,7 @@ class CounterfactualBranchCollector:
             self._found_quadrants[env_idx].add(quadrant)
         self._active_branches[env_idx] = None
         self._pending_perturbed_actions[env_idx] = None
+        self._plans[env_idx] = None
         if (
             self._found_quadrants[env_idx] >= self.target_quadrants
             or self._branch_counts[env_idx] >= self.max_branches_per_root
@@ -230,13 +336,61 @@ class CounterfactualBranchCollector:
         self._check_env_idx(env_idx)
         return self._active_branches[env_idx]
 
-    def _sample_branch(self, env_idx: int) -> CounterfactualBranch:
+    @staticmethod
+    def _branch_weights(
+        history: deque, strategy: BranchStrategy
+    ) -> np.ndarray | None:
+        """Branch-point probabilities for ``risk_weighted`` (None = uniform)."""
+        if strategy.branch_point_mode != "risk_weighted":
+            return None
+        distances = []
+        for snapshot in history:
+            hazards = filter_hazards(snapshot.hazards, strategy)
+            if snapshot.eef_pos is None or not hazards:
+                distances.append(np.inf)
+                continue
+            distances.append(
+                min(
+                    float(np.linalg.norm(position - snapshot.eef_pos))
+                    for _, position in hazards
+                )
+            )
+        distances = np.asarray(distances, dtype=np.float64)
+        if not np.isfinite(distances).any():
+            return None
+        weights = np.where(
+            np.isfinite(distances),
+            np.exp(-distances / strategy.risk_distance_scale),
+            0.0,
+        )
+        weights = weights + strategy.risk_weight_floor
+        return weights / weights.sum()
+
+    def _perturb(
+        self,
+        env_idx: int,
+        original: np.ndarray,
+        *,
+        alpha: float,
+        strategy: BranchStrategy,
+        directed: bool,
+        hazard_pos: np.ndarray | None,
+        eef_pos: np.ndarray | None,
+    ) -> np.ndarray:
+        """Mix ``original`` with random or hazard-directed commands."""
         rng = self._rngs[env_idx]
-        history = self._histories[env_idx]
-        snapshot = history[int(rng.integers(0, len(history)))]
-        alpha = float(rng.uniform(*self.perturbation_range))
-        original = snapshot.action.copy()
         random_action = rng.uniform(-1.0, 1.0, size=original.shape)
+        target = random_action.copy()
+        if directed and hazard_pos is not None and eef_pos is not None:
+            offset = np.asarray(hazard_pos, dtype=np.float64) - np.asarray(
+                eef_pos, dtype=np.float64
+            )
+            norm = float(np.linalg.norm(offset))
+            if norm > 1e-6:
+                # OSC delta translation is in the robot base frame, which is
+                # axis-aligned with the world frame in LIBERO scenes.
+                gain = strategy.directed_gain
+                target[:3] = gain * offset / norm + (1.0 - gain) * random_action[:3]
         perturbed = original.copy()
         for action_index in self.action_dimensions:
             if not 0 <= action_index < original.size:
@@ -245,8 +399,52 @@ class CounterfactualBranchCollector:
                 )
             perturbed[action_index] = (1.0 - alpha) * original[
                 action_index
-            ] + alpha * random_action[action_index]
-        perturbed = np.clip(perturbed, -1.0, 1.0)
+            ] + alpha * target[action_index]
+        if strategy.gripper_mode == "close":
+            perturbed[-1] = 1.0
+        elif strategy.gripper_mode == "open":
+            perturbed[-1] = -1.0
+        return np.clip(perturbed, -1.0, 1.0)
+
+    def _sample_branch(self, env_idx: int) -> CounterfactualBranch:
+        rng = self._rngs[env_idx]
+        strategy = self._strategies[env_idx]
+        history = self._histories[env_idx]
+        weights = self._branch_weights(history, strategy)
+        if weights is None:
+            snapshot = history[int(rng.integers(0, len(history)))]
+        else:
+            snapshot = history[int(rng.choice(len(history), p=weights))]
+        perturbation_range = strategy.perturbation_range or self.perturbation_range
+        alpha = float(rng.uniform(*perturbation_range))
+        hazard_key, hazard_pos = None, None
+        hazards = filter_hazards(snapshot.hazards, strategy)
+        if hazards and snapshot.eef_pos is not None:
+            hazard_key, hazard_pos = min(
+                hazards,
+                key=lambda item: float(np.linalg.norm(item[1] - snapshot.eef_pos)),
+            )
+        directed = False
+        perturb_steps = strategy.perturb_steps
+        # The legacy strategy keeps the original RNG call sequence exactly.
+        if strategy != LEGACY_STRATEGY:
+            directed = hazard_pos is not None and bool(
+                rng.random() < strategy.directed_prob
+            )
+            if strategy.perturb_steps_min is not None:
+                perturb_steps = int(
+                    rng.integers(strategy.perturb_steps_min, strategy.perturb_steps + 1)
+                )
+        original = snapshot.action.copy()
+        perturbed = self._perturb(
+            env_idx,
+            original,
+            alpha=alpha,
+            strategy=strategy,
+            directed=directed,
+            hazard_pos=hazard_pos,
+            eef_pos=snapshot.eef_pos,
+        )
         branch_number = int(self._branch_counts[env_idx])
         self._branch_counts[env_idx] += 1
         root_episode_id = self._root_episode_ids[env_idx]
@@ -258,15 +456,71 @@ class CounterfactualBranchCollector:
             root_timestep=snapshot.timestep,
             simulator_state=copy.deepcopy(snapshot.simulator_state),
             alpha=alpha,
-            perturbation_range=self.perturbation_range,
+            perturbation_range=perturbation_range,
             original_action=original,
             perturbed_action=perturbed,
             perturbation=perturbed - original,
+            strategy=strategy,
+            perturb_steps=perturb_steps,
+            directed=directed,
+            hazard_key=hazard_key,
+            hazard_pos=None if hazard_pos is None else hazard_pos.copy(),
+            hazards=snapshot.hazards,
         )
         self._active_branches[env_idx] = branch
         self._pending_perturbed_actions[env_idx] = perturbed.copy()
+        self._plans[env_idx] = (
+            _PerturbationPlan(branch=branch) if perturb_steps > 1 else None
+        )
         return branch
 
     def _check_env_idx(self, env_idx: int) -> None:
         if not 0 <= env_idx < self.num_envs:
             raise IndexError(f"env_idx={env_idx} is outside [0, {self.num_envs})")
+
+
+def normalize_hazards(hazards: Any) -> Hazards:
+    """Accept a mapping or (key, position) pairs; drop entries without positions."""
+    if not hazards:
+        return ()
+    items = hazards.items() if isinstance(hazards, dict) else hazards
+    normalized = []
+    for key, position in items:
+        if position is None:
+            continue
+        array = np.asarray(position, dtype=np.float64).reshape(-1)
+        if array.size == 3 and np.isfinite(array).all():
+            normalized.append((str(key), array.copy()))
+    return tuple(normalized)
+
+
+def filter_hazards(hazards: Hazards, strategy: BranchStrategy) -> Hazards:
+    """Keep hazards whose key contains one of the strategy's filter tokens."""
+    if not strategy.hazard_filters:
+        return hazards
+    tokens = tuple(token.lower() for token in strategy.hazard_filters)
+    return tuple(
+        (key, position)
+        for key, position in hazards
+        if any(token in key.lower() for token in tokens)
+    )
+
+
+def hazards_from_predicates(predicates: list[dict[str, Any]] | None) -> Hazards:
+    """Extract ``("<instance_id>|<predicate>|<object>", hazard_pos)`` pairs."""
+    hazards = []
+    for predicate in predicates or []:
+        if predicate.get("semantics") != "violation":
+            continue
+        position = predicate.get("hazard_pos")
+        if position is None:
+            continue
+        key = "|".join(
+            (
+                str(predicate.get("instance_id", "")),
+                str(predicate.get("predicate", "")),
+                str(predicate.get("hazard_object", "")),
+            )
+        )
+        hazards.append((key, position))
+    return normalize_hazards(hazards)

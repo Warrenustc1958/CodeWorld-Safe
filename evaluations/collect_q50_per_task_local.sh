@@ -60,6 +60,14 @@ TASKS_PER_JOB="${TASKS_PER_JOB:-1}"
 MAX_ROUNDS="${MAX_ROUNDS:-20}"
 MAX_BRANCHES="${MAX_BRANCHES:-8}"
 RISK_WINDOW="${RISK_WINDOW:-32}"
+# Branch strategy: "auto" = per-suite/task hazard-directed strategies
+# (rlinf/envs/sim/libero/counterfactual_strategy.py); "legacy" = uniform tail
+# point + one random step. AUX_SAFETY=1 adds wrong-part-grasp / unconstrained
+# hand-contact predicates (required for affordance, whose BDDL has no
+# constraints) and counts them as unsafe for quadrant labels.
+BRANCH_STRATEGY="${BRANCH_STRATEGY:-auto}"
+AUX_SAFETY="${AUX_SAFETY:-1}"
+if [[ "${AUX_SAFETY}" == "1" ]]; then AUX_SAFETY_BOOL=true; else AUX_SAFETY_BOOL=false; fi
 MAX_ROLLOUT_STEPS=$(((MAX_BRANCHES + 1) * 512))
 
 if (( TASKS_PER_JOB < 1 )); then
@@ -142,11 +150,15 @@ PY
 }
 
 SUITES=(affordance human_safety obstacle_avoidance obstacle_avoidance_human)
+# Paper Sec. 3.4 / Appendix: the training split uses only L0/L1 of the 4
+# physical-safety suites; L2 is held out for OOD evaluation, so no
+# counterfactual data is built for it. Override with e.g. LEVELS="0".
+read -r -a LEVELS <<< "${LEVELS:-0 1}"
 incomplete_any=0
 
 for suite_index in "${!SUITES[@]}"; do
   suite="${SUITES[$suite_index]}"
-  for level_number in 0 1 2; do
+  for level_number in "${LEVELS[@]}"; do
     level="L${level_number}"
     mapfile -t all_task_ids < <(task_ids_for_level "${suite}" "${level_number}")
     if (( ${#all_task_ids[@]} == 0 )); then
@@ -179,6 +191,7 @@ for suite_index in "${!SUITES[@]}"; do
         echo "suite=${suite} level=${level} tasks=${filter} round=${round}"
         echo "total_envs=${total_envs}; approximately $((total_envs / 2)) envs/GPU"
         echo "output=${round_root}"
+        echo "branch_strategy=${BRANCH_STRATEGY} aux_safety=${AUX_SAFETY}"
         echo "============================================================"
 
         ray stop --force || true
@@ -205,6 +218,9 @@ for suite_index in "${!SUITES[@]}"; do
             "env.eval.episode_auditor.counterfactual_branch.target_quadrants=[Q2,Q4]" \
             "env.eval.episode_auditor.counterfactual_branch.perturbation_range=[0.15,1.0]" \
             "env.eval.episode_auditor.counterfactual_branch.action_dimensions=[0,1,2,3,4,5]" \
+            "++env.eval.episode_auditor.counterfactual_branch.strategy=${BRANCH_STRATEGY}" \
+            "++env.eval.episode_auditor.aux_safety.enabled=${AUX_SAFETY_BOOL}" \
+            "++env.eval.episode_auditor.aux_safety.count_as_unsafe=${AUX_SAFETY_BOOL}" \
           2>&1 | tee "${round_root}/launcher.log"
       done
     done
