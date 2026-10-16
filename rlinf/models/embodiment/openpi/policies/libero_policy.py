@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import os
 
 import einops
 import numpy as np
@@ -29,6 +30,9 @@ def make_libero_example() -> dict:
         ),
         "prompt": "do something",
     }
+
+
+_WRIST_MODE_LOGGED = False
 
 
 def _parse_image(image) -> np.ndarray:
@@ -66,7 +70,18 @@ class LiberoInputs(transforms.DataTransformFn):
         # replace it with zeros like we do for the
         # right wrist image below.
         base_image = _parse_image(data["observation/image"])
-        wrist_image = _parse_image(data["observation/wrist_image"])
+        # Wrist-view ablation (eval only): RLINF_PI05_WRIST_MODE=real|zero|mask.
+        #   zero: black wrist image, still attended; mask: black + image_mask False
+        #   (same treatment as the absent right-wrist camera).
+        wrist_mode = os.environ.get("RLINF_PI05_WRIST_MODE", "real")
+        if wrist_mode == "real":
+            wrist_image = _parse_image(data["observation/wrist_image"])
+        else:
+            wrist_image = np.zeros_like(base_image)
+            global _WRIST_MODE_LOGGED
+            if not _WRIST_MODE_LOGGED:
+                print(f"[libero_policy] RLINF_PI05_WRIST_MODE={wrist_mode}", flush=True)
+                _WRIST_MODE_LOGGED = True
 
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
@@ -79,7 +94,7 @@ class LiberoInputs(transforms.DataTransformFn):
             },
             "image_mask": {
                 "base_0_rgb": np.True_,
-                "left_wrist_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.False_ if wrist_mode == "mask" else np.True_,
                 # We only mask padding images for pi0 model, not pi0-FAST. Do not change this for your own dataset.
                 "right_wrist_0_rgb": np.True_
                 if self.model_type == _model.ModelType.PI0_FAST
