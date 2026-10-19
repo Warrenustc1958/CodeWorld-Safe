@@ -401,6 +401,12 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
 
         # Unnormalize predicted actions
         actions = self._unnormalize_actions(normalized_actions, self.unnorm_key)
+        # Models trained on env-convention gripper actions (-1 open, +1 close; e.g.
+        # LeRobot LIBERO-Safety demos) emit +-1 here, but prepare_actions_for_libero
+        # expects the RLDS convention (0..1, 1 = open) and inverts it. Convert so
+        # the env receives the action the model meant. Default "rlds" = unchanged.
+        if getattr(self.config, "gripper_convention", "rlds") == "env":
+            actions[..., -1] = (1.0 - actions[..., -1]) / 2.0
         actions = actions.reshape(idxs.shape)
 
         action_logits = processed_logits_tensor

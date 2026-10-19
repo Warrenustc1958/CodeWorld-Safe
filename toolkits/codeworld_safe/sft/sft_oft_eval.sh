@@ -25,7 +25,13 @@ OUT=${OUT:-$R/rollouts/eval_oft/${SUITE}_${LEVEL}_$(date +%m%d_%H%M)}
 mkdir -p "$OUT"
 
 extra=("runner.logger.log_path=$OUT")
-[ -n "${CKPT:-}" ] && extra+=("runner.ckpt_path=$CKPT")
+if [ -n "${CKPT:-}" ]; then
+  extra+=("runner.ckpt_path=$CKPT")
+  # Our SFT ckpts are trained on LeRobot LIBERO-Safety demos: gripper in env
+  # convention (-1 open, +1 close) and no center crop. Without these two the
+  # gripper is inverted at eval time and SR collapses to 0.
+  extra+=("+rollout.model.gripper_convention=${GRIPPER:-env}" "rollout.model.center_crop=${CROP:-False}")
+fi
 [ -n "${STATS:-}" ] && extra+=("+rollout.model.dataset_statistics_path=$STATS")
 [ -n "${TASKS:-}" ] && extra+=("env.eval.task_id_filter=$TASKS")
 
