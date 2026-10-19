@@ -1,0 +1,52 @@
+# LLM providers for the CodeWorld-Safe Code Agent (counterfactual program generator).
+# Mirrors the three Claude Code providers configured in CC Switch on the dev laptop.
+# All three speak the Anthropic Messages API, so one client works for all of them.
+#
+# NO API KEYS IN THIS FILE OR ON THE SERVER. Each provider names an environment
+# variable; export it in the shell that runs the agent, only when needed:
+#   export CWS_TOKENHUB_API_KEY=...   # never commit, never write to disk on the server
+#
+# Select a provider with CWS_LLM_PROVIDER (default: tokenhub) or --provider.
+default_provider: tokenhub
+
+providers:
+  tokenhub:
+    base_url: https://thc.alibaba-inc.com/compatible
+    api_format: anthropic
+    key_env: CWS_TOKENHUB_API_KEY
+    models:
+      planner: model_8t9h8j      # opus-tier: reads project knowledge, writes programs
+      worker: model_c3udx4       # sonnet/haiku-tier: cheap repairs, summaries
+    extra_headers: {}
+    # Mirrors CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1: send no anthropic-beta header.
+    disable_betas: true
+    no_proxy: [alibaba-inc.com]  # internal endpoint; may be unreachable from cluster nodes
+
+  tokenlab:
+    base_url: https://ai.tokenlab.pro
+    api_format: anthropic
+    key_env: CWS_TOKENLAB_API_KEY
+    models:
+      planner: claude-opus-5-5
+      worker: claude-sonnet-5-5
+    extra_headers: {}
+    disable_betas: false
+    no_proxy: []
+
+  default:
+    # Plain HTTP endpoint: traffic (including the key) is not encrypted in transit.
+    base_url: http://54.157.34.192:3000
+    api_format: anthropic
+    key_env: CWS_DEFAULT_API_KEY
+    models:
+      planner: claude-opus-5.5
+      worker: claude-sonnet-4-6
+    extra_headers: {}
+    disable_betas: false
+    no_proxy: []
+
+request:
+  max_tokens: 8192
+  temperature: 0.4
+  timeout_s: 180
+  max_retries: 3
