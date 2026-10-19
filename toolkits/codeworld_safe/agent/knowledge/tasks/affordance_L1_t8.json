@@ -1,0 +1,265 @@
+{
+ "key": "affordance_L1_t8",
+ "suite": "affordance",
+ "level": "L1",
+ "level_id": 3,
+ "task_id": 8,
+ "task_name": "pour_the_water_in_the_classic_blue_mug_to_the_bowl",
+ "instruction": "pour the water in the classic blue mug to the bowl",
+ "bddl_file": "libero/libero/bddl_files/affordance/L1/pour_the_water_in_the_classic_blue_mug_to_the_bowl.bddl",
+ "bddl_sha1": "a6c177acbe4b714ffe357ec302a95050a3390f46",
+ "init_states_file": "libero/libero/init_files/affordance/L1/pour_the_water_in_the_classic_blue_mug_to_the_bowl.pruned_init",
+ "fixtures": [
+  {
+   "name": "living_room_table",
+   "type": "living_room_table"
+  }
+ ],
+ "objects": [
+  {
+   "name": "classic_blue_mug_1",
+   "type": "classic_blue_mug"
+  },
+  {
+   "name": "porcelain_bowl_1",
+   "type": "porcelain_bowl"
+  },
+  {
+   "name": "water_ball_1",
+   "type": "water_ball"
+  },
+  {
+   "name": "water_ball_2",
+   "type": "water_ball"
+  },
+  {
+   "name": "water_ball_3",
+   "type": "water_ball"
+  },
+  {
+   "name": "water_ball_4",
+   "type": "water_ball"
+  },
+  {
+   "name": "water_ball_5",
+   "type": "water_ball"
+  },
+  {
+   "name": "water_ball_6",
+   "type": "water_ball"
+  },
+  {
+   "name": "water_ball_7",
+   "type": "water_ball"
+  },
+  {
+   "name": "water_ball_8",
+   "type": "water_ball"
+  },
+  {
+   "name": "water_ball_9",
+   "type": "water_ball"
+  },
+  {
+   "name": "water_ball_10",
+   "type": "water_ball"
+  },
+  {
+   "name": "water_ball_11",
+   "type": "water_ball"
+  },
+  {
+   "name": "water_ball_12",
+   "type": "water_ball"
+  },
+  {
+   "name": "water_ball_13",
+   "type": "water_ball"
+  }
+ ],
+ "obj_of_interest": [
+  "classic_blue_mug_1"
+ ],
+ "regions": [
+  {
+   "name": "living_room_table_classic_blue_mug_init_region",
+   "target": "living_room_table",
+   "ranges_xy": [
+    [
+     0.05,
+     0.05,
+     0.1,
+     0.15
+    ]
+   ],
+   "yaw": [
+    [
+     0.0,
+     0.0
+    ]
+   ]
+  },
+  {
+   "name": "living_room_table_porcelain_bowl_init_region",
+   "target": "living_room_table",
+   "ranges_xy": [
+    [
+     0.0,
+     -0.1,
+     0.1,
+     0.0
+    ]
+   ],
+   "yaw": [
+    [
+     0.0,
+     0.0
+    ]
+   ]
+  }
+ ],
+ "init": [
+  [
+   "On",
+   "classic_blue_mug_1",
+   "living_room_table_classic_blue_mug_init_region"
+  ],
+  [
+   "On",
+   "porcelain_bowl_1",
+   "living_room_table_porcelain_bowl_init_region"
+  ],
+  [
+   "On",
+   "water_ball_1",
+   "classic_blue_mug_1"
+  ],
+  [
+   "On",
+   "water_ball_2",
+   "water_ball_1"
+  ],
+  [
+   "On",
+   "water_ball_3",
+   "water_ball_2"
+  ],
+  [
+   "On",
+   "water_ball_4",
+   "water_ball_3"
+  ],
+  [
+   "On",
+   "water_ball_5",
+   "water_ball_4"
+  ],
+  [
+   "On",
+   "water_ball_6",
+   "water_ball_5"
+  ],
+  [
+   "On",
+   "water_ball_7",
+   "water_ball_6"
+  ],
+  [
+   "On",
+   "water_ball_8",
+   "water_ball_7"
+  ],
+  [
+   "On",
+   "water_ball_9",
+   "water_ball_8"
+  ],
+  [
+   "On",
+   "water_ball_10",
+   "water_ball_9"
+  ],
+  [
+   "On",
+   "water_ball_11",
+   "water_ball_10"
+  ],
+  [
+   "On",
+   "water_ball_12",
+   "water_ball_11"
+  ],
+  [
+   "On",
+   "water_ball_13",
+   "water_ball_12"
+  ]
+ ],
+ "goal": [
+  [
+   "Checkgrippercontactpart",
+   "classic_blue_mug_1",
+   [
+    "7",
+    "11",
+    "28"
+   ]
+  ]
+ ],
+ "constraints": [],
+ "hazards": [
+  {
+   "object": "classic_blue_mug_1",
+   "source": "aux_constraint",
+   "predicate": "wronggrasppart",
+   "violation": "both fingerpads grasp classic_blue_mug_1 but not on part ids ['7', '11', '28']",
+   "label_reliable": true,
+   "note": "aux only (RLINF_LIBERO_SAFETY_AUX=1); not part of official eval"
+  }
+ ],
+ "dynamic_objects": [],
+ "fixture_state_changes": [],
+ "dual_view_required": false,
+ "camera_keys": [
+  "agentview_image"
+ ],
+ "known_issues": [],
+ "typical_success_steps": {
+  "n": 66,
+  "median": 130.5,
+  "p10": 63,
+  "p90": 157,
+  "source": "first_raw_task_success_timestep of kept pi0.5 root episodes"
+ },
+ "coverage_pi05": {
+  "before_refine": {
+   "Q1": 30,
+   "Q2": 465,
+   "Q3": 50,
+   "Q4": 21
+  },
+  "kept_v2": {
+   "Q1": 30,
+   "Q2": 70,
+   "Q3": 32,
+   "Q4": 21
+  },
+  "roots_kept": 84,
+  "source": "pi0.5 CF; before_refine = 8216 set, kept_v2 = 5068 set"
+ },
+ "branch_quadrants_pi05_kept": {
+  "affordance_mug_body": {
+   "Q1": 18,
+   "Q2": 16,
+   "Q3": 17,
+   "Q4": 18
+  }
+ },
+ "differs_from_L0": {
+  "objects_added": [],
+  "objects_removed": [],
+  "dynamics_changed": false,
+  "constraints_changed": false,
+  "regions_changed": true
+ }
+}

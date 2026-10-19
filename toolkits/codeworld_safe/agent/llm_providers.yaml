@@ -6,8 +6,10 @@
 # variable; export it in the shell that runs the agent, only when needed:
 #   export CWS_TOKENHUB_API_KEY=...   # never commit, never write to disk on the server
 #
-# Select a provider with CWS_LLM_PROVIDER (default: tokenhub) or --provider.
-default_provider: tokenhub
+# Select a provider with CWS_LLM_PROVIDER (default: default) or --provider.
+# 10-19: tokenhub reachable from gpu005/gpu006 but planner returns COMPAT_001 and worker
+# returns an empty body; reverted to default.
+default_provider: default
 
 providers:
   tokenhub:
@@ -40,7 +42,7 @@ providers:
     key_env: CWS_DEFAULT_API_KEY
     models:
       planner: claude-opus-5.5
-      worker: claude-sonnet-4-6
+      worker: claude-opus-5.5    # claude-sonnet-4-6 -> HTTP 503 model_not_found on this gateway (10-19)
     extra_headers: {}
     disable_betas: false
     no_proxy: []

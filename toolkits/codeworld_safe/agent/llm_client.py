@@ -47,6 +47,8 @@ class LLMClient:
         if not key:
             raise LLMError(f"set {self.p['key_env']} in the environment to use provider {name}")
         self._key = key
+        self.last_usage: dict = {}
+        self.last_model: str | None = None
         if self.p.get("no_proxy"):
             hosts = os.environ.get("NO_PROXY", "")
             os.environ["NO_PROXY"] = ",".join(filter(None, [hosts, *self.p["no_proxy"]]))
@@ -76,6 +78,9 @@ class LLMClient:
                 req = urllib.request.Request(url, json.dumps(body).encode(), headers, method="POST")
                 with urllib.request.urlopen(req, timeout=self.req["timeout_s"]) as r:
                     data = json.load(r)
+                # Token counts as reported by the gateway (input_tokens/output_tokens), for budgeting.
+                self.last_usage = data.get("usage") or {}
+                self.last_model = data.get("model")
                 return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
             except urllib.error.HTTPError as e:
                 detail = e.read()[:300].decode(errors="replace")
@@ -92,13 +97,15 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--provider")
     ap.add_argument("--ping", action="store_true")
+    ap.add_argument("--role", default="worker", choices=["planner", "worker"])
     args = ap.parse_args()
     client = LLMClient(args.provider)
     if args.ping:
         t = time.time()
-        out = client.complete("Reply with the single word: pong", "ping", role="worker", max_tokens=8)
-        print(json.dumps({"provider": client.name, "model": client.model("worker"),
-                          "reply": out.strip()[:20], "latency_s": round(time.time() - t, 2)}))
+        out = client.complete("Reply with the single word: pong", "ping", role=args.role, max_tokens=8)
+        print(json.dumps({"provider": client.name, "role": args.role, "model": client.model(args.role),
+                          "served_model": client.last_model, "reply": out.strip()[:20],
+                          "usage": client.last_usage, "latency_s": round(time.time() - t, 2)}))
 
 
 if __name__ == "__main__":

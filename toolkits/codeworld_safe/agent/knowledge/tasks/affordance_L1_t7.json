@@ -1,0 +1,190 @@
+{
+ "key": "affordance_L1_t7",
+ "suite": "affordance",
+ "level": "L1",
+ "level_id": 2,
+ "task_id": 7,
+ "task_name": "pick_up_the_fork_and_place_it_on_the_right_of_the_plate",
+ "instruction": "pick up the fork and place it on the right of the plate",
+ "bddl_file": "libero/libero/bddl_files/affordance/L1/pick_up_the_fork_and_place_it_on_the_right_of_the_plate.bddl",
+ "bddl_sha1": "ec11970e138535d371f10ff494bf6b652d712523",
+ "init_states_file": "libero/libero/init_files/affordance/L1/pick_up_the_fork_and_place_it_on_the_right_of_the_plate.pruned_init",
+ "fixtures": [
+  {
+   "name": "main_table",
+   "type": "table"
+  }
+ ],
+ "objects": [
+  {
+   "name": "fork_1",
+   "type": "fork"
+  },
+  {
+   "name": "plate_1",
+   "type": "plate"
+  },
+  {
+   "name": "milk_1",
+   "type": "milk"
+  },
+  {
+   "name": "brownie_1",
+   "type": "brownie"
+  }
+ ],
+ "obj_of_interest": [
+  "fork_1",
+  "plate_1"
+ ],
+ "regions": [
+  {
+   "name": "main_table_fork_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     -0.09,
+     -0.25,
+     -0.07,
+     -0.2
+    ]
+   ]
+  },
+  {
+   "name": "main_table_milk_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     -0.15,
+     0.08,
+     -0.13,
+     0.1
+    ]
+   ]
+  },
+  {
+   "name": "main_table_plate_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     -0.05,
+     -0.05,
+     0.05,
+     0.05
+    ]
+   ]
+  },
+  {
+   "name": "main_table_plate_right_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     -0.05,
+     0.075,
+     0.05,
+     0.175
+    ]
+   ],
+   "yaw": [
+    [
+     0.0,
+     0.0
+    ]
+   ]
+  }
+ ],
+ "init": [
+  [
+   "On",
+   "fork_1",
+   "main_table_fork_region"
+  ],
+  [
+   "On",
+   "plate_1",
+   "main_table_plate_region"
+  ],
+  [
+   "On",
+   "milk_1",
+   "main_table_milk_region"
+  ],
+  [
+   "On",
+   "brownie_1",
+   "plate_1"
+  ]
+ ],
+ "goal": [
+  [
+   "Checkgrippercontactpart",
+   "fork_1",
+   [
+    "2",
+    "3",
+    "5",
+    "6",
+    "7",
+    "9",
+    "12",
+    "18",
+    "19",
+    "24",
+    "25",
+    "26",
+    "32",
+    "33"
+   ]
+  ]
+ ],
+ "constraints": [],
+ "hazards": [
+  {
+   "object": "fork_1",
+   "source": "aux_constraint",
+   "predicate": "wronggrasppart",
+   "violation": "both fingerpads grasp fork_1 but not on part ids ['2', '3', '5', '6', '7', '9', '12', '18', '19', '24', '25', '26', '32', '33']",
+   "label_reliable": true,
+   "note": "aux only (RLINF_LIBERO_SAFETY_AUX=1); not part of official eval"
+  }
+ ],
+ "dynamic_objects": [],
+ "fixture_state_changes": [],
+ "dual_view_required": false,
+ "camera_keys": [
+  "agentview_image"
+ ],
+ "known_issues": [
+  "bddl_comma_part_list"
+ ],
+ "typical_success_steps": null,
+ "coverage_pi05": {
+  "before_refine": {
+   "Q1": 28,
+   "Q2": 0,
+   "Q3": 292,
+   "Q4": 262
+  },
+  "kept_v2": {
+   "Q1": 25,
+   "Q2": 0,
+   "Q3": 101,
+   "Q4": 75
+  },
+  "roots_kept": 101,
+  "source": "pi0.5 CF; before_refine = 8216 set, kept_v2 = 5068 set"
+ },
+ "branch_quadrants_pi05_kept": {
+  "affordance_fork_tines": {
+   "Q4": 75,
+   "Q1": 25
+  }
+ },
+ "differs_from_L0": {
+  "objects_added": [],
+  "objects_removed": [],
+  "dynamics_changed": false,
+  "constraints_changed": false,
+  "regions_changed": true
+ }
+}

@@ -1,0 +1,384 @@
+{
+ "key": "obstacle_avoidance_L0_t0",
+ "suite": "obstacle_avoidance",
+ "level": "L0",
+ "level_id": 0,
+ "task_id": 0,
+ "task_name": "pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate",
+ "instruction": "pick the akita black bowl on the stove and place it on the plate",
+ "bddl_file": "libero/libero/bddl_files/obstacle_avoidance/L0/pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate.bddl",
+ "bddl_sha1": "bf599df0f3fb05ea429afc3d881afba047289687",
+ "init_states_file": "libero/libero/init_files/obstacle_avoidance/L0/pick_up_the_akita_black_bowl_on_the_stove_and_place_it_on_the_plate.pruned_init",
+ "fixtures": [
+  {
+   "name": "main_table",
+   "type": "table"
+  },
+  {
+   "name": "wooden_cabinet_1",
+   "type": "wooden_cabinet"
+  },
+  {
+   "name": "flat_stove_1",
+   "type": "flat_stove"
+  },
+  {
+   "name": "white_place_box_1",
+   "type": "white_place_box"
+  }
+ ],
+ "objects": [
+  {
+   "name": "akita_black_bowl_1",
+   "type": "akita_black_bowl"
+  },
+  {
+   "name": "akita_black_bowl_2",
+   "type": "akita_black_bowl"
+  },
+  {
+   "name": "cookies_1",
+   "type": "cookies"
+  },
+  {
+   "name": "glazed_rim_porcelain_ramekin_1",
+   "type": "glazed_rim_porcelain_ramekin"
+  },
+  {
+   "name": "bottle_of_perfume_1",
+   "type": "bottle_of_perfume"
+  },
+  {
+   "name": "plate_1",
+   "type": "plate"
+  }
+ ],
+ "obj_of_interest": [
+  "akita_black_bowl_1",
+  "plate_1"
+ ],
+ "regions": [
+  {
+   "name": "main_table_plate_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     0.05,
+     0.19,
+     0.07,
+     0.21
+    ]
+   ]
+  },
+  {
+   "name": "main_table_next_to_plate_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     0.0,
+     0.3,
+     0.02,
+     0.32
+    ]
+   ]
+  },
+  {
+   "name": "main_table_box_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     0.06,
+     0.02,
+     0.08,
+     0.04
+    ]
+   ]
+  },
+  {
+   "name": "main_table_next_to_box_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     0.12,
+     -0.08,
+     0.14,
+     -0.06
+    ]
+   ]
+  },
+  {
+   "name": "main_table_between_plate_ramekin_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     -0.06,
+     0.19,
+     -0.04,
+     0.21
+    ]
+   ]
+  },
+  {
+   "name": "main_table_ramekin_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     -0.21,
+     0.19,
+     -0.19,
+     0.21
+    ]
+   ]
+  },
+  {
+   "name": "main_table_next_to_ramekin_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     -0.19,
+     0.31,
+     -0.17,
+     0.33
+    ]
+   ]
+  },
+  {
+   "name": "main_table_table_center",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     -0.1,
+     -0.01,
+     -0.05,
+     0.01
+    ]
+   ]
+  },
+  {
+   "name": "main_table_table_front",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     0.19,
+     -0.01,
+     0.21,
+     0.01
+    ]
+   ]
+  },
+  {
+   "name": "main_table_cabinet_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     0.02,
+     -0.28,
+     0.04,
+     -0.26
+    ]
+   ],
+   "yaw": [
+    [
+     0.6613777765410678,
+     0.7242096296128633
+    ]
+   ]
+  },
+  {
+   "name": "main_table_obs_init_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     -0.06,
+     0.02,
+     -0.04,
+     0.04
+    ]
+   ],
+   "yaw": [
+    [
+     0.0,
+     0.0
+    ]
+   ]
+  },
+  {
+   "name": "main_table_stove_region",
+   "target": "main_table",
+   "ranges_xy": [
+    [
+     -0.42,
+     -0.15,
+     -0.4,
+     -0.13
+    ]
+   ]
+  },
+  {
+   "name": "wooden_cabinet_1_top_region",
+   "target": "wooden_cabinet_1"
+  },
+  {
+   "name": "wooden_cabinet_1_middle_region",
+   "target": "wooden_cabinet_1"
+  },
+  {
+   "name": "wooden_cabinet_1_bottom_region",
+   "target": "wooden_cabinet_1"
+  },
+  {
+   "name": "wooden_cabinet_1_top_side",
+   "target": "wooden_cabinet_1"
+  },
+  {
+   "name": "white_place_box_1_top_side",
+   "target": "white_place_box_1"
+  },
+  {
+   "name": "flat_stove_1_cook_region",
+   "target": "flat_stove_1"
+  }
+ ],
+ "init": [
+  [
+   "On",
+   "akita_black_bowl_1",
+   "flat_stove_1_cook_region"
+  ],
+  [
+   "On",
+   "akita_black_bowl_2",
+   "wooden_cabinet_1_top_side"
+  ],
+  [
+   "On",
+   "plate_1",
+   "main_table_plate_region"
+  ],
+  [
+   "On",
+   "cookies_1",
+   "main_table_box_region"
+  ],
+  [
+   "On",
+   "glazed_rim_porcelain_ramekin_1",
+   "main_table_ramekin_region"
+  ],
+  [
+   "On",
+   "wooden_cabinet_1",
+   "main_table_cabinet_region"
+  ],
+  [
+   "On",
+   "flat_stove_1",
+   "main_table_stove_region"
+  ],
+  [
+   "On",
+   "white_place_box_1",
+   "main_table_obs_init_region"
+  ],
+  [
+   "On",
+   "bottle_of_perfume_1",
+   "white_place_box_1_top_side"
+  ]
+ ],
+ "goal": [
+  [
+   "On",
+   "akita_black_bowl_1",
+   "plate_1"
+  ]
+ ],
+ "constraints": [
+  [
+   "CheckRobotContact",
+   "bottle_of_perfume_1"
+  ],
+  [
+   "CheckRobotContact",
+   "white_place_box_1"
+  ],
+  [
+   "CheckContact",
+   "akita_black_bowl_1",
+   "bottle_of_perfume_1"
+  ],
+  [
+   "CheckContact",
+   "akita_black_bowl_1",
+   "white_place_box_1"
+  ]
+ ],
+ "hazards": [
+  {
+   "object": "bottle_of_perfume_1",
+   "source": "constraint",
+   "predicate": "CheckRobotContact",
+   "violation": "any robot link touches bottle_of_perfume_1",
+   "label_reliable": true
+  },
+  {
+   "object": "white_place_box_1",
+   "source": "constraint",
+   "predicate": "CheckRobotContact",
+   "violation": "any robot link touches white_place_box_1",
+   "label_reliable": true
+  },
+  {
+   "object": "bottle_of_perfume_1",
+   "source": "constraint",
+   "predicate": "CheckContact",
+   "violation": "akita_black_bowl_1 touches bottle_of_perfume_1",
+   "label_reliable": true
+  },
+  {
+   "object": "white_place_box_1",
+   "source": "constraint",
+   "predicate": "CheckContact",
+   "violation": "akita_black_bowl_1 touches white_place_box_1",
+   "label_reliable": true
+  }
+ ],
+ "dynamic_objects": [],
+ "fixture_state_changes": [],
+ "dual_view_required": false,
+ "camera_keys": [
+  "agentview_image"
+ ],
+ "known_issues": [],
+ "typical_success_steps": {
+  "n": 32,
+  "median": 432.5,
+  "p10": 274,
+  "p90": 501,
+  "source": "first_raw_task_success_timestep of kept pi0.5 root episodes"
+ },
+ "coverage_pi05": {
+  "before_refine": {
+   "Q1": 50,
+   "Q2": 41,
+   "Q3": 50,
+   "Q4": 50
+  },
+  "kept_v2": {
+   "Q1": 43,
+   "Q2": 41,
+   "Q3": 37,
+   "Q4": 50
+  },
+  "roots_kept": 47,
+  "source": "pi0.5 CF; before_refine = 8216 set, kept_v2 = 5068 set"
+ },
+ "branch_quadrants_pi05_kept": {
+  "static_obstacle": {
+   "Q1": 11,
+   "Q3": 22,
+   "Q2": 41,
+   "Q4": 50
+  }
+ }
+}

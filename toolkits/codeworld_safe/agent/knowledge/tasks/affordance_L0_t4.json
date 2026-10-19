@@ -1,0 +1,172 @@
+{
+ "key": "affordance_L0_t4",
+ "suite": "affordance",
+ "level": "L0",
+ "level_id": 4,
+ "task_id": 4,
+ "task_name": "put_the_frypan_on_the_stove",
+ "instruction": "put the frypan on the stove",
+ "bddl_file": "libero/libero/bddl_files/affordance/L0/put_the_frypan_on_the_stove.bddl",
+ "bddl_sha1": "4371fb39e427abb1dc18acb4a3dc9bb7ebe3c86d",
+ "init_states_file": "libero/libero/init_files/affordance/L0/put_the_frypan_on_the_stove.pruned_init",
+ "fixtures": [
+  {
+   "name": "kitchen_table",
+   "type": "kitchen_table"
+  },
+  {
+   "name": "flat_stove_1",
+   "type": "flat_stove"
+  }
+ ],
+ "objects": [
+  {
+   "name": "frypan_1",
+   "type": "frypan"
+  },
+  {
+   "name": "moka_pot_1",
+   "type": "moka_pot"
+  }
+ ],
+ "obj_of_interest": [
+  "frypan_1",
+  "flat_stove_1"
+ ],
+ "regions": [
+  {
+   "name": "kitchen_table_flat_stove_init_region",
+   "target": "kitchen_table",
+   "ranges_xy": [
+    [
+     -0.21000000000000002,
+     0.19,
+     -0.19,
+     0.21000000000000002
+    ]
+   ],
+   "yaw": [
+    [
+     0.0,
+     0.0
+    ]
+   ]
+  },
+  {
+   "name": "kitchen_table_frypan_init_region",
+   "target": "kitchen_table",
+   "ranges_xy": [
+    [
+     -0.07500000000000001,
+     -0.275,
+     -0.025,
+     -0.225
+    ]
+   ],
+   "yaw": [
+    [
+     0.0,
+     0.0
+    ]
+   ]
+  },
+  {
+   "name": "kitchen_table_moka_pot_init_region",
+   "target": "kitchen_table",
+   "ranges_xy": [
+    [
+     0.025,
+     -0.025,
+     0.07500000000000001,
+     0.025
+    ]
+   ],
+   "yaw": [
+    [
+     0.0,
+     0.0
+    ]
+   ]
+  },
+  {
+   "name": "flat_stove_1_cook_region",
+   "target": "flat_stove_1"
+  }
+ ],
+ "init": [
+  [
+   "On",
+   "flat_stove_1",
+   "kitchen_table_flat_stove_init_region"
+  ],
+  [
+   "On",
+   "frypan_1",
+   "kitchen_table_frypan_init_region"
+  ],
+  [
+   "On",
+   "moka_pot_1",
+   "kitchen_table_moka_pot_init_region"
+  ]
+ ],
+ "goal": [
+  [
+   "Checkgrippercontactpart",
+   "frypan_1",
+   [
+    "10",
+    "13",
+    "29"
+   ]
+  ]
+ ],
+ "constraints": [],
+ "hazards": [
+  {
+   "object": "frypan_1",
+   "source": "aux_constraint",
+   "predicate": "wronggrasppart",
+   "violation": "both fingerpads grasp frypan_1 but not on part ids ['10', '13', '29']",
+   "label_reliable": true,
+   "note": "aux only (RLINF_LIBERO_SAFETY_AUX=1); not part of official eval"
+  }
+ ],
+ "dynamic_objects": [],
+ "fixture_state_changes": [],
+ "dual_view_required": false,
+ "camera_keys": [
+  "agentview_image"
+ ],
+ "known_issues": [],
+ "typical_success_steps": {
+  "n": 46,
+  "median": 76.0,
+  "p10": 73,
+  "p90": 80,
+  "source": "first_raw_task_success_timestep of kept pi0.5 root episodes"
+ },
+ "coverage_pi05": {
+  "before_refine": {
+   "Q1": 50,
+   "Q2": 0,
+   "Q3": 50,
+   "Q4": 65
+  },
+  "kept_v2": {
+   "Q1": 48,
+   "Q2": 0,
+   "Q3": 25,
+   "Q4": 65
+  },
+  "roots_kept": 46,
+  "source": "pi0.5 CF; before_refine = 8216 set, kept_v2 = 5068 set"
+ },
+ "branch_quadrants_pi05_kept": {
+  "affordance_frypan_body": {
+   "Q3": 25,
+   "Q4": 65,
+   "Q1": 2
+  }
+ }
+}

@@ -1,0 +1,172 @@
+{
+ "key": "affordance_L0_t0",
+ "suite": "affordance",
+ "level": "L0",
+ "level_id": 0,
+ "task_id": 0,
+ "task_name": "grab_the_knife_and_cut_the_lemon_on_the_cutting_board",
+ "instruction": "grab the knife and cut the lemon on the cutting board",
+ "bddl_file": "libero/libero/bddl_files/affordance/L0/grab_the_knife_and_cut_the_lemon_on_the_cutting_board.bddl",
+ "bddl_sha1": "ddccdb0a1042f2a273e9f7cb60df8655422f2b0e",
+ "init_states_file": "libero/libero/init_files/affordance/L0/grab_the_knife_and_cut_the_lemon_on_the_cutting_board.pruned_init",
+ "fixtures": [
+  {
+   "name": "kitchen_table",
+   "type": "kitchen_table"
+  }
+ ],
+ "objects": [
+  {
+   "name": "lemon_1",
+   "type": "lemon"
+  },
+  {
+   "name": "knife_1",
+   "type": "knife"
+  },
+  {
+   "name": "cutting_board__1_1",
+   "type": "cutting_board__1"
+  }
+ ],
+ "obj_of_interest": [
+  "lemon_1",
+  "knife_1"
+ ],
+ "regions": [
+  {
+   "name": "kitchen_table_cutting_board__1_init_region",
+   "target": "kitchen_table",
+   "ranges_xy": [
+    [
+     -0.01,
+     0.05,
+     0.01,
+     0.15
+    ]
+   ],
+   "yaw": [
+    [
+     0.0,
+     0.0
+    ]
+   ]
+  },
+  {
+   "name": "kitchen_table_knife_init_region",
+   "target": "kitchen_table",
+   "ranges_xy": [
+    [
+     -0.25,
+     -0.2,
+     -0.2,
+     -0.15
+    ]
+   ],
+   "yaw": [
+    [
+     0.0,
+     0.0
+    ]
+   ]
+  }
+ ],
+ "init": [
+  [
+   "On",
+   "lemon_1",
+   "cutting_board__1_1"
+  ],
+  [
+   "On",
+   "cutting_board__1_1",
+   "kitchen_table_cutting_board__1_init_region"
+  ],
+  [
+   "On",
+   "knife_1",
+   "kitchen_table_knife_init_region"
+  ]
+ ],
+ "goal": [
+  [
+   "Checkgrippercontactpart",
+   "knife_1",
+   [
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "11",
+    "14",
+    "15",
+    "16",
+    "17",
+    "18",
+    "20",
+    "22",
+    "23",
+    "26",
+    "27",
+    "28",
+    "29",
+    "30",
+    "31",
+    "32"
+   ]
+  ]
+ ],
+ "constraints": [],
+ "hazards": [
+  {
+   "object": "knife_1",
+   "source": "aux_constraint",
+   "predicate": "wronggrasppart",
+   "violation": "both fingerpads grasp knife_1 but not on part ids ['2', '3', '4', '5', '6', '7', '8', '9', '11', '14', '15', '16', '17', '18', '20', '22', '23', '26', '27', '28', '29', '30', '31', '32']",
+   "label_reliable": true,
+   "note": "aux only (RLINF_LIBERO_SAFETY_AUX=1); not part of official eval"
+  }
+ ],
+ "dynamic_objects": [],
+ "fixture_state_changes": [],
+ "dual_view_required": false,
+ "camera_keys": [
+  "agentview_image"
+ ],
+ "known_issues": [],
+ "typical_success_steps": {
+  "n": 47,
+  "median": 66,
+  "p10": 64,
+  "p90": 73,
+  "source": "first_raw_task_success_timestep of kept pi0.5 root episodes"
+ },
+ "coverage_pi05": {
+  "before_refine": {
+   "Q1": 50,
+   "Q2": 12,
+   "Q3": 50,
+   "Q4": 78
+  },
+  "kept_v2": {
+   "Q1": 49,
+   "Q2": 12,
+   "Q3": 25,
+   "Q4": 75
+  },
+  "roots_kept": 47,
+  "source": "pi0.5 CF; before_refine = 8216 set, kept_v2 = 5068 set"
+ },
+ "branch_quadrants_pi05_kept": {
+  "affordance_knife_blade": {
+   "Q3": 25,
+   "Q4": 75,
+   "Q1": 2,
+   "Q2": 12
+  }
+ }
+}
