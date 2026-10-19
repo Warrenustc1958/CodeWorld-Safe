@@ -319,6 +319,26 @@ class StitchedSequence:
 # point and the branch's first frame. Restored MuJoCo states re-render with
 # ~0.02 drift; anything near this bound means the wrong root or timestep.
 BRANCH_FRAME_MATCH_TOLERANCE = 2.0
+# Max |qpos/qvel| difference between a branch's first sim-state snapshot and
+# the root snapshot it was restored from (both from state/<id>.npz sidecars).
+BRANCH_STATE_MATCH_TOLERANCE = 1e-6
+
+
+def _sim_state_at(episode: ValidatedEpisode, timestep: int) -> np.ndarray | None:
+    """qpos/qvel of the sidecar snapshot taken before ``timestep`` (None if absent)."""
+    meta = episode.record.get("sim_state_trajectory")
+    if not isinstance(meta, dict) or timestep not in (meta.get("timesteps") or []):
+        return None
+    relative = Path(str(meta.get("path", "")))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"{episode.audit_path}: sim-state sidecar path must be local")
+    path = episode.audit_path.parent / relative
+    if not path.is_file():
+        raise ValueError(f"{episode.audit_path}: sim-state sidecar not found: {path}")
+    with np.load(path, allow_pickle=False) as state:
+        index = list(state["timesteps"]).index(timestep)
+        # mujoco_state = [time, qpos..., qvel...]; time restarts in a branch.
+        return np.asarray(state["mujoco_state"][index][1:], dtype=np.float64)
 
 
 def _is_branch(episode: ValidatedEpisode) -> bool:
@@ -337,51 +357,82 @@ def _load_images(episode: ValidatedEpisode) -> np.ndarray:
         return np.asarray(sidecar[episode.camera_key], dtype=np.uint8)
 
 
-def _stitch_sequence(
-    episode: ValidatedEpisode, root: ValidatedEpisode | None
-) -> StitchedSequence:
-    """Return the episode, prefixed by its root history when it is a branch."""
+def _own_sequence(episode: ValidatedEpisode) -> StitchedSequence:
     steps = list(episode.record["trajectory"])
-    images = _load_images(episode)
-    if root is None:
-        return StitchedSequence(
-            steps=steps,
-            images=images,
-            segments=["episode"] * len(steps),
-            init_state=_initial_state(episode.record),
-            root_prefix_transitions=0,
-        )
+    return StitchedSequence(
+        steps=steps,
+        images=_load_images(episode),
+        segments=["episode"] * len(steps),
+        init_state=_initial_state(episode.record),
+        root_prefix_transitions=0,
+    )
 
+
+def _branch_prefix(episode: ValidatedEpisode, parent: StitchedSequence) -> int:
+    """Transitions of the parent's stitched sequence that precede the branch.
+
+    ``branch_timestep`` counts the parent's own audit steps (1-based), so in
+    the parent's stitched coordinates the branch starts after the parent's
+    inherited prefix plus ``branch_timestep - 1`` of its own steps.
+    """
     raw_branch_timestep = _record_field(episode.record, "branch_timestep")
     if raw_branch_timestep is None:
         raise ValueError(f"{episode.audit_path}: branch has no branch_timestep")
-    branch_timestep = int(raw_branch_timestep)
-    prefix = branch_timestep - 1
-    root_steps = root.record["trajectory"]
-    if not 0 <= prefix <= len(root_steps):
+    return parent.root_prefix_transitions + int(raw_branch_timestep) - 1
+
+
+def _stitch_onto(
+    episode: ValidatedEpisode, parent: ValidatedEpisode, parent_seq: StitchedSequence
+) -> StitchedSequence:
+    """Prefix ``episode`` with ``parent_seq`` up to the branch point (P3).
+
+    Out-of-range branch points and seam mismatches are errors, never a silent
+    fallback to the parent's last frame.
+    """
+    own = _own_sequence(episode)
+    branch_timestep = int(_record_field(episode.record, "branch_timestep"))
+    own_parent_steps = parent.record["trajectory"]
+    if not 0 <= branch_timestep - 1 <= len(own_parent_steps):
         raise ValueError(
             f"{episode.audit_path}: branch_timestep={branch_timestep} is outside "
-            f"root {root.episode_id} with {len(root_steps)} transitions"
+            f"root {parent.episode_id} with {len(own_parent_steps)} transitions"
         )
-    if prefix and int(root_steps[prefix - 1]["timestep"]) != prefix:
+    if branch_timestep - 1 and int(own_parent_steps[branch_timestep - 2]["timestep"]) != (
+        branch_timestep - 1
+    ):
         raise ValueError(
-            f"{root.audit_path}: root timesteps are not contiguous 1-based; "
+            f"{parent.audit_path}: root timesteps are not contiguous 1-based; "
             f"cannot locate branch_timestep={branch_timestep}"
         )
-    if root.camera_key != episode.camera_key:
+    if parent.camera_key != episode.camera_key:
         raise ValueError("root and branch must use the same camera key")
-
-    root_images = _load_images(root)
-    if root_images.shape[1:] != images.shape[1:]:
+    prefix = _branch_prefix(episode, parent_seq)
+    if parent_seq.images.shape[1:] != own.images.shape[1:]:
         raise ValueError(
-            f"{episode.audit_path}: frame shape {images.shape[1:]} differs from "
-            f"root {root_images.shape[1:]}"
+            f"{episode.audit_path}: frame shape {own.images.shape[1:]} differs from "
+            f"root {parent_seq.images.shape[1:]}"
         )
-    drift = float(
-        np.abs(
-            root_images[prefix].astype(np.int16) - images[0].astype(np.int16)
-        ).mean()
-    )
+    parent_state = _sim_state_at(parent, branch_timestep)
+    own_state = _sim_state_at(episode, 1)
+    if parent_state is not None and own_state is not None:
+        # Exact pairing proof from the sidecars. Pixels are not used here: late
+        # in long episodes robosuite's observable clock samples 1-2 substeps
+        # before the step ends, so a fast-moving root frame legitimately
+        # differs from the freshly rendered restore frame.
+        state_diff = float(np.abs(parent_state - own_state).max())
+        if state_diff > BRANCH_STATE_MATCH_TOLERANCE:
+            raise ValueError(
+                f"{episode.audit_path}: branch start simulator state differs from "
+                f"root {parent.episode_id} snapshot before step {branch_timestep} "
+                f"by {state_diff:.3g}; root/branch pairing is inconsistent"
+            )
+        drift = 0.0
+    else:
+        drift = float(
+            np.abs(
+                parent_seq.images[prefix].astype(np.int16) - own.images[0].astype(np.int16)
+            ).mean()
+        )
     if drift > BRANCH_FRAME_MATCH_TOLERANCE:
         raise ValueError(
             f"{episode.audit_path}: first branch frame differs from root frame "
@@ -389,14 +440,62 @@ def _stitch_sequence(
             "root/branch pairing is inconsistent"
         )
     return StitchedSequence(
-        steps=list(root_steps[:prefix]) + steps,
-        # The restored branch frame replaces root frame `prefix`, so the
+        steps=list(parent_seq.steps[:prefix]) + own.steps,
+        # The restored branch frame replaces parent frame `prefix`, so the
         # sequence stays frame[t] + action[t] -> frame[t + 1] across the seam.
-        images=np.concatenate([root_images[:prefix], images], axis=0),
-        segments=["root_prefix"] * prefix + ["episode"] * len(steps),
-        init_state=_initial_state(root.record),
+        images=np.concatenate([parent_seq.images[:prefix], own.images], axis=0),
+        segments=["root_prefix"] * prefix + own.segments,
+        init_state=parent_seq.init_state,
         root_prefix_transitions=prefix,
     )
+
+
+def _stitch_sequence(
+    episode: ValidatedEpisode, root: ValidatedEpisode | None
+) -> StitchedSequence:
+    """Return the episode, prefixed by its (non-branch) root history."""
+    if root is None:
+        return _own_sequence(episode)
+    return _stitch_onto(episode, root, _own_sequence(root))
+
+
+def _stitch_chain(
+    episode: ValidatedEpisode,
+    lookup: dict[tuple[str, str], ValidatedEpisode],
+    max_depth: int = 8,
+) -> tuple[StitchedSequence, list[ValidatedEpisode]]:
+    """Stitch along the parent chain; returns the sequence and the ancestors."""
+    chain = [episode]
+    while _is_branch(chain[-1]):
+        parent = lookup.get(_root_key(chain[-1]))
+        if parent is None:
+            raise ValueError(
+                f"{chain[-1].audit_path}: root episode {_root_key(chain[-1])[1]} not "
+                "found under the audit roots; pass the full run directory "
+                "or use --no-stitch-branches"
+            )
+        if parent in chain or len(chain) > max_depth:
+            raise ValueError(f"{episode.audit_path}: branch parent chain is cyclic or too deep")
+        chain.append(parent)
+    sequence = _own_sequence(chain[-1])
+    for child, parent in zip(reversed(chain[:-1]), reversed(chain[1:])):
+        sequence = _stitch_onto(child, parent, sequence)
+    return sequence, chain[1:]
+
+
+def _stitched_frames(
+    episode: ValidatedEpisode, lookup: dict[tuple[str, str], ValidatedEpisode]
+) -> int:
+    """Frame count of the stitched sequence without loading any image."""
+    frames = episode.num_transitions + 1
+    item = episode
+    while _is_branch(item):
+        parent = lookup.get(_root_key(item))
+        if parent is None:
+            return frames
+        frames += int(_record_field(item.record, "branch_timestep")) - 1
+        item = parent
+    return frames
 
 
 def _step_labels(
@@ -559,6 +658,7 @@ def build_dataset(
     min_per_quadrant: dict[str, int] | None = None,
     stitch_branches: bool = True,
     dry_run: bool = False,
+    min_frames: int = 16,
 ) -> dict[str, Any]:
     """Validate, select, split, and export one unified Wan/SAM dataset."""
     if train_fraction < 0 or val_fraction < 0 or train_fraction + val_fraction > 1:
@@ -604,7 +704,29 @@ def build_dataset(
             f"Refusing to build with {len(invalid)} invalid audit episode(s): {examples}"
         )
 
-    eligible = [episode for episode in valid if episode.quadrant in selected_quadrants]
+    # Roots are resolved against every valid episode, not only the selected
+    # ones, so a Q2 branch can be stitched even when its Q1 root is filtered.
+    by_source_id = {
+        (item.collection_id, item.source_episode_id): item for item in valid
+    }
+    # Episodes whose (stitched) sequence is shorter than min_frames are never
+    # sampled by the Wan trainer; reject them here with a reason (P9).
+    too_short = [
+        item
+        for item in valid
+        if (
+            _stitched_frames(item, by_source_id)
+            if stitch_branches
+            else item.num_transitions + 1
+        )
+        < min_frames
+    ]
+    short_ids = {item.episode_id for item in too_short}
+    eligible = [
+        episode
+        for episode in valid
+        if episode.quadrant in selected_quadrants and episode.episode_id not in short_ids
+    ]
     grouped: dict[str, list[ValidatedEpisode]] = defaultdict(list)
     for episode in eligible:
         grouped[episode.quadrant].append(episode)
@@ -630,11 +752,6 @@ def build_dataset(
     if not selected:
         raise ValueError("No episodes remain after quadrant selection")
 
-    # Roots are resolved against every valid episode, not only the selected
-    # ones, so a Q2 branch can be stitched even when its Q1 root is filtered.
-    by_source_id = {
-        (item.collection_id, item.source_episode_id): item for item in valid
-    }
     roots_by_id: dict[str, ValidatedEpisode | None] = {}
     prefix_by_id: dict[str, int] = {}
     for item in selected:
@@ -647,12 +764,12 @@ def build_dataset(
                     "found under the audit roots; pass the full run directory "
                     "or use --no-stitch-branches"
                 )
-            if _is_branch(root):
-                raise ValueError(f"{item.audit_path}: root is itself a branch")
             raw_branch_timestep = _record_field(item.record, "branch_timestep")
             if raw_branch_timestep is None:
                 raise ValueError(f"{item.audit_path}: branch has no branch_timestep")
-            prefix_by_id[item.episode_id] = int(raw_branch_timestep) - 1
+            prefix_by_id[item.episode_id] = (
+                _stitched_frames(item, by_source_id) - item.num_transitions - 1
+            )
         roots_by_id[item.episode_id] = root
 
     split_by_id = {
@@ -678,6 +795,9 @@ def build_dataset(
         ),
         "stitch_branches": stitch_branches,
         "branches_stitched": len(prefix_by_id),
+        "min_frames": min_frames,
+        "rejected_too_short": len(too_short),
+        "rejected_too_short_examples": [item.episode_id for item in too_short[:5]],
         "frame_layout": "T+1 frames; last frame is the outcome with action_valid=False",
         "quadrant_counts": {
             quadrant: selected_counts[quadrant] for quadrant in QUADRANTS
@@ -709,7 +829,11 @@ def build_dataset(
     for episode in selected:
         split = split_by_id[episode.episode_id]
         root = roots_by_id[episode.episode_id]
-        sequence = _stitch_sequence(episode, root)
+        sequence = (
+            _stitch_chain(episode, by_source_id)[0]
+            if root is not None
+            else _own_sequence(episode)
+        )
         labels = _step_labels(episode, sequence, risk_horizons)
         wan_frames = _wan_frames(episode, sequence, labels)
         wan_name = f"traj{split_indices[split]:06d}.npy"
@@ -815,6 +939,12 @@ def _parser() -> argparse.ArgumentParser:
         help="Export counterfactual branches without their root prefix.",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--min-frames",
+        type=int,
+        default=16,
+        help="Reject episodes whose stitched sequence has fewer frames.",
+    )
     return parser
 
 
@@ -838,6 +968,7 @@ def main() -> None:
         ),
         stitch_branches=args.stitch_branches,
         dry_run=args.dry_run,
+        min_frames=args.min_frames,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

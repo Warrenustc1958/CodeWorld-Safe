@@ -23,6 +23,7 @@ from typing import Any
 
 import numpy as np
 
+from rlinf.envs.sim.libero.cf_executor import ProgramExecutor
 from rlinf.envs.sim.libero.counterfactual_strategy import (
     LEGACY_STRATEGY,
     BranchStrategy,
@@ -70,10 +71,15 @@ class CounterfactualBranch:
     hazard_pos: np.ndarray | None = None
     hazards: Hazards = ()
     root_quadrant: str = "Q1"
+    # Set when a cws_cf_program drives the branch (ProgramExecutor.branch_metadata).
+    program: dict[str, Any] | None = None
 
     def metadata(self) -> dict[str, Any]:
         """Return JSON-compatible branch metadata for the episode auditor."""
+        extra = dict(self.program) if self.program else {}
         return {
+            **extra,
+            "parent_episode_id": self.root_episode_id,
             "root_episode_id": self.root_episode_id,
             "root_quadrant": self.root_quadrant,
             "branch_id": self.branch_id,
@@ -183,6 +189,9 @@ class CounterfactualBranchCollector:
         self._plans: list[_PerturbationPlan | None] = [None] * self.num_envs
         self._root_quadrants: list[str] = ["Q1"] * self.num_envs
         self._search_targets = [self.target_quadrants] * self.num_envs
+        self._executors: list[ProgramExecutor | None] = [None] * self.num_envs
+        # Transitions the auditor saved for the current root (P2 guard).
+        self._root_saved_steps: list[int | None] = [None] * self.num_envs
 
     def accepts_root(self, quadrant: str) -> bool:
         """Return whether a root ending in ``quadrant`` starts a search."""
@@ -203,6 +212,25 @@ class CounterfactualBranchCollector:
         if self._histories[env_idx].maxlen != length:
             self._histories[env_idx] = deque(maxlen=length)
 
+    def set_program(self, env_idx: int, executor: ProgramExecutor | None) -> None:
+        """Bind (or clear) a cws_cf_program executor right after ``reset_root``.
+
+        With an executor, snapshots are kept only at action-chunk boundaries
+        over the whole episode, and branch points come from the program.
+        """
+        self._check_env_idx(env_idx)
+        if not self.is_collecting_root(env_idx) or self._histories[env_idx]:
+            raise RuntimeError("set_program must be called right after reset_root")
+        self._executors[env_idx] = executor
+        if executor is not None:
+            length = executor.max_total_steps // executor.chunk + 1
+            if self._histories[env_idx].maxlen != length:
+                self._histories[env_idx] = deque(maxlen=length)
+
+    def executor(self, env_idx: int) -> ProgramExecutor | None:
+        self._check_env_idx(env_idx)
+        return self._executors[env_idx]
+
     def strategy(self, env_idx: int) -> BranchStrategy:
         """Return the strategy bound to an environment."""
         self._check_env_idx(env_idx)
@@ -221,6 +249,7 @@ class CounterfactualBranchCollector:
         self._plans[env_idx] = None
         self._root_quadrants[env_idx] = "Q1"
         self._search_targets[env_idx] = self.target_quadrants
+        self._root_saved_steps[env_idx] = None
 
     def set_root_episode_id(self, env_idx: int, episode_id: str) -> None:
         """Bind the audit record created at root reset to this search."""
@@ -257,10 +286,23 @@ class CounterfactualBranchCollector:
         action: np.ndarray,
         hazards: Any = (),
         eef_pos: np.ndarray | None = None,
+        saved_steps: int | None = None,
     ) -> None:
-        """Record a bounded pre-action snapshot while the root is active."""
+        """Record a bounded pre-action snapshot while the root is active.
+
+        ``saved_steps`` is the number of transitions the auditor holds for the
+        active root. A snapshot before step ``t`` is only usable when
+        ``t - 1 == saved_steps`` (the prefix can be rebuilt from the saved
+        root); anything else is skipped instead of producing an unstitchable
+        branch later (P2).
+        """
         self._check_env_idx(env_idx)
         if not self.is_collecting_root(env_idx):
+            return
+        if saved_steps is not None and int(timestep) - 1 != int(saved_steps):
+            return
+        executor = self._executors[env_idx]
+        if executor is not None and not executor.is_chunk_boundary(timestep):
             return
         self._histories[env_idx].append(
             RiskSnapshot(
@@ -280,9 +322,20 @@ class CounterfactualBranchCollector:
         *,
         root_episode_id: str | None = None,
         root_quadrant: str = "Q1",
+        root_saved_steps: int | None = None,
     ) -> CounterfactualBranch | None:
-        """Begin branching after the recorded root ended in an accepted quadrant."""
+        """Begin branching after the recorded root ended in an accepted quadrant.
+
+        ``root_saved_steps`` (transitions in the saved root audit) drops any
+        snapshot whose prefix would not be inside the saved root (P2).
+        """
         self._check_env_idx(env_idx)
+        if root_saved_steps is not None:
+            self._root_saved_steps[env_idx] = int(root_saved_steps)
+            history = self._histories[env_idx]
+            kept = [s for s in history if s.timestep - 1 <= int(root_saved_steps)]
+            history.clear()
+            history.extend(kept)
         root_quadrant = str(root_quadrant).upper()
         if root_quadrant not in self.root_quadrants:
             raise ValueError(
@@ -328,6 +381,13 @@ class CounterfactualBranchCollector:
         self._pending_perturbed_actions[env_idx] = None
         if action is not None:
             return action.copy()
+        branch = self._active_branches[env_idx]
+        executor = self._executors[env_idx]
+        if branch is not None and branch.program is not None and executor is not None:
+            if policy_action is None or not executor.active:
+                return None
+            live = normalize_hazards(hazards) if hazards is not None else branch.hazards
+            return executor.action(policy_action, eef_pos, live)
         plan = self._plans[env_idx]
         if plan is None or policy_action is None:
             return None
@@ -448,7 +508,60 @@ class CounterfactualBranchCollector:
             perturbed[-1] = -1.0
         return np.clip(perturbed, -1.0, 1.0)
 
-    def _sample_branch(self, env_idx: int) -> CounterfactualBranch:
+    def _sample_program_branch(self, env_idx: int) -> CounterfactualBranch | None:
+        executor = self._executors[env_idx]
+        history = self._histories[env_idx]
+        saved = self._root_saved_steps[env_idx]
+        if saved is None:
+            saved = max((s.timestep for s in history), default=1) - 1
+        snapshot = executor.choose_branch_point(list(history), saved)
+        if snapshot is None:
+            self._phases[env_idx] = "finished"
+            return None
+        executor.start(snapshot)
+        original = snapshot.action.copy()
+        perturbed = executor.action(original, snapshot.eef_pos, snapshot.hazards)
+        branch_number = int(self._branch_counts[env_idx])
+        self._branch_counts[env_idx] += 1
+        root_episode_id = self._root_episode_ids[env_idx]
+        if root_episode_id is None:
+            raise RuntimeError("root episode id is missing")
+        hazard_pos = None
+        name = executor.program.trigger.hazard
+        for key, pos in snapshot.hazards:
+            if name is None or key.split("|")[-1] == name:
+                hazard_pos = np.asarray(pos, dtype=np.float64).copy()
+                hazard_key = key
+                break
+        else:
+            hazard_key = None
+        branch = CounterfactualBranch(
+            root_episode_id=root_episode_id,
+            branch_id=f"{root_episode_id}-branch-{branch_number:03d}",
+            root_timestep=snapshot.timestep,
+            simulator_state=copy.deepcopy(snapshot.simulator_state),
+            alpha=1.0,
+            perturbation_range=(1.0, 1.0),
+            original_action=original,
+            perturbed_action=perturbed,
+            perturbation=perturbed - original,
+            strategy=self._strategies[env_idx],
+            perturb_steps=executor.total_steps + 1,
+            directed=any(e.op == "servo_toward" for e in executor.program.events),
+            hazard_key=hazard_key,
+            hazard_pos=hazard_pos,
+            hazards=snapshot.hazards,
+            root_quadrant=self._root_quadrants[env_idx],
+            program=executor.branch_metadata(),
+        )
+        self._active_branches[env_idx] = branch
+        self._pending_perturbed_actions[env_idx] = perturbed.copy()
+        self._plans[env_idx] = None
+        return branch
+
+    def _sample_branch(self, env_idx: int) -> CounterfactualBranch | None:
+        if self._executors[env_idx] is not None:
+            return self._sample_program_branch(env_idx)
         rng = self._rngs[env_idx]
         strategy = self._strategies[env_idx]
         history = self._histories[env_idx]

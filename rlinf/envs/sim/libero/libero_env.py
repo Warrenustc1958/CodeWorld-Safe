@@ -15,9 +15,11 @@
 import copy
 import glob
 import importlib
+import json
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Optional, Union
 
 import gym
@@ -25,6 +27,8 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.envs.sim.libero.cf_executor import ProgramExecutor
+from rlinf.envs.sim.libero.cf_program import load_program, sample_params
 from rlinf.envs.sim.libero.counterfactual_branch_collector import (
     CounterfactualBranch,
     CounterfactualBranchCollector,
@@ -349,7 +353,14 @@ class LiberoEnv(gym.Env):
                         "visual_camera_keys", ["agentview_image"]
                     )
                 ),
+                save_sim_state=bool(auditor_cfg.get("save_sim_state", False)),
             )
+        # Snapshot cadence for the sim-state sidecar; matches the OFT action chunk.
+        self._sim_state_chunk = (
+            int(auditor_cfg.get("sim_state_chunk", 8)) if auditor_cfg is not None else 8
+        )
+        # Steps a program branch inherits from its root (P8); 0 for roots/legacy.
+        self._cf_step_offset = np.zeros(self.num_envs, dtype=np.int32)
         self.counterfactual_branch_collector = None
         self._defer_counterfactual_restore = False
         self._pending_counterfactual_restores = [None] * self.num_envs
@@ -430,6 +441,48 @@ class LiberoEnv(gym.Env):
                 "episode_auditor.aux_safety.enabled=true branches cannot become unsafe"
             )
         self._hazards = [() for _ in range(self.num_envs)]
+        # cws_cf_program/v0: a Code-Agent program replaces the preset strategy.
+        self._cf_program = None
+        self._cf_chunk = int(branch_cfg.get("action_chunk", 8))
+        program_path = branch_cfg.get("program", None)
+        if program_path:
+            if self.counterfactual_branch_collector is None:
+                raise ValueError("counterfactual_branch.program requires enabled=true")
+            knowledge_dir = branch_cfg.get("program_knowledge_dir", None)
+            if not knowledge_dir:
+                raise ValueError(
+                    "counterfactual_branch.program needs program_knowledge_dir "
+                    "(directory with tasks/<suite>_L<k>_t<id>.json)"
+                )
+            raw_program = json.loads(Path(str(program_path)).read_text())
+            cell = raw_program.get("cell", {})
+            task_file = (
+                Path(str(knowledge_dir))
+                / "tasks"
+                / f"{cell.get('suite')}_{cell.get('level')}_t{cell.get('task_id')}.json"
+            )
+            self._cf_program = load_program(raw_program, json.loads(task_file.read_text()))
+            if self._cf_program.scene_mutated:
+                raise NotImplementedError(
+                    "scene.mutations are validated but not executed yet; "
+                    "use a branch-only program"
+                )
+            if self._cf_program.suite != str(self.cfg.task_suite_name).lower() or (
+                self._cf_program.level != f"L{self.safety_level}"
+            ):
+                raise ValueError(
+                    f"program cell {self._cf_program.cell_key} does not match "
+                    f"{self.cfg.task_suite_name} L{self.safety_level}"
+                )
+            if int(self.cfg.max_episode_steps) % self._cf_chunk:
+                raise ValueError("max_episode_steps must be a multiple of action_chunk (P14)")
+            self._cf_rng = np.random.default_rng(
+                [int(branch_cfg.get("seed", self.seed)), int(self.seed_offset), 0xCF]
+            )
+            logger.info(
+                f"counterfactual program {self._cf_program.program_id} "
+                f"({self._cf_program.cell_key}, target {self._cf_program.target_quadrant})"
+            )
 
     def _log_evaluation_mode(self):
         """Log the LIBERO evaluation mode banner (rank 0 env worker only)."""
@@ -1022,6 +1075,8 @@ class LiberoEnv(gym.Env):
             self.first_collision_step[mask] = -1
             self.consecutive_violation_steps[mask] = 0
             self._elapsed_steps[env_idx] = 0
+            if hasattr(self, "_cf_step_offset"):
+                self._cf_step_offset[env_idx] = 0
         else:
             self.prev_step_reward[:] = 0
             self.success_once[:] = False
@@ -1037,6 +1092,8 @@ class LiberoEnv(gym.Env):
             self.first_collision_step[:] = -1
             self.consecutive_violation_steps[:] = 0
             self._elapsed_steps[:] = 0
+            if hasattr(self, "_cf_step_offset"):
+                self._cf_step_offset[:] = 0
 
     @staticmethod
     def _find_active_obstacle(obs):
@@ -1316,6 +1373,9 @@ class LiberoEnv(gym.Env):
                 self.counterfactual_branch_collector.set_strategy(
                     env_id, self._resolve_branch_strategy(env_id)
                 )
+                self.counterfactual_branch_collector.set_program(
+                    env_id, self._make_program_executor(env_id)
+                )
             self._hazards[env_id] = ()
             if self.episode_auditor is not None:
                 self.episode_auditor.start_episode(
@@ -1334,6 +1394,20 @@ class LiberoEnv(gym.Env):
                     self.counterfactual_branch_collector.set_root_episode_id(
                         env_id, episode_id
                     )
+
+    def _make_program_executor(self, env_id: int):
+        """A fresh executor (new parameter draw) when the env runs the program's task."""
+        program = self._cf_program
+        if program is None or int(self.task_ids[env_id]) != program.task_id:
+            return None
+        rng = np.random.default_rng(int(self._cf_rng.integers(0, 2**63 - 1)))
+        return ProgramExecutor(
+            program,
+            sample_params(program, rng),
+            rng,
+            chunk=self._cf_chunk,
+            max_total_steps=int(self.cfg.max_episode_steps),
+        )
 
     def _auditor_episode_metadata(
         self,
@@ -1454,21 +1528,48 @@ class LiberoEnv(gym.Env):
             if perturbed_action is not None:
                 prepared_actions[env_id] = perturbed_action
 
-        root_env_ids = [
-            env_id
-            for env_id in range(self.num_envs)
-            if collector.is_collecting_root(env_id)
-        ]
-        if root_env_ids:
-            snapshots = self.env.snapshot_simulator_state(id=root_env_ids)
-            for env_id, snapshot in zip(root_env_ids, snapshots):
+        auditor = self.episode_auditor
+        want_state = auditor is not None and auditor.save_sim_state
+        root_env_ids, state_env_ids = [], []
+        for env_id in range(self.num_envs):
+            if self._pending_counterfactual_restores[env_id] is not None:
+                continue
+            next_step = int(self.elapsed_steps[env_id]) + 1
+            executor = collector.executor(env_id)
+            if collector.is_collecting_root(env_id) and (
+                executor is None or executor.is_chunk_boundary(next_step)
+            ):
+                root_env_ids.append(env_id)
+            if (
+                want_state
+                and auditor.saved_steps(env_id) is not None
+                and (next_step - 1) % self._sim_state_chunk == 0
+            ):
+                state_env_ids.append(env_id)
+        snap_ids = sorted(set(root_env_ids) | set(state_env_ids))
+        if snap_ids:
+            snapshots = dict(
+                zip(snap_ids, self.env.snapshot_simulator_state(id=snap_ids))
+            )
+            for env_id in root_env_ids:
+                saved = None
+                if auditor is not None:
+                    # -1 when no audit is active: the root already finalized, so
+                    # nothing after it can be stitched (P2).
+                    saved = auditor.saved_steps(env_id)
+                    saved = -1 if saved is None else saved
                 collector.record_root_step(
                     env_id,
                     timestep=int(self.elapsed_steps[env_id]) + 1,
-                    simulator_state=snapshot,
+                    simulator_state=snapshots[env_id],
                     action=prepared_actions[env_id],
                     hazards=self._hazards[env_id],
                     eef_pos=self._current_eef_pos(env_id),
+                    saved_steps=saved,
+                )
+            for env_id in state_env_ids:
+                auditor.record_sim_state(
+                    env_id, int(self.elapsed_steps[env_id]) + 1, snapshots[env_id]
                 )
         return prepared_actions
 
@@ -1494,6 +1595,9 @@ class LiberoEnv(gym.Env):
         # Hazards seen at the branch point; refreshed by the next step's audit.
         self._hazards[env_id] = branch.hazards
         self._reset_metrics(np.asarray([env_id]))
+        if branch.program is not None:
+            # The branch continues the root's clock: stitched length <= max_episode_steps (P8).
+            self._cf_step_offset[env_id] = int(branch.root_timestep) - 1
         self.episode_auditor.start_episode(
             env_id,
             metadata=self._auditor_episode_metadata(
@@ -1551,7 +1655,13 @@ class LiberoEnv(gym.Env):
                             f"{root_quadrant} root episode has no bound auditor id"
                         )
                     branch = collector.begin_search(
-                        env_id, root_quadrant=root_quadrant
+                        env_id,
+                        root_quadrant=root_quadrant,
+                        root_saved_steps=(
+                            self.episode_auditor.last_finalized_steps(env_id)
+                            if self.episode_auditor is not None
+                            else None
+                        ),
                     )
             elif collector.is_running_branch(env_id) and bool(
                 terminations[env_id] or truncations[env_id]
@@ -1593,6 +1703,7 @@ class LiberoEnv(gym.Env):
         predicate_audits = [
             info.pop("_libero_safety_predicates", []) for info in info_lists
         ]
+        fixture_qpos = [info.pop("_libero_fixture_qpos", None) for info in info_lists]
         raw_goal_terminations = np.asarray(goal_terminations, dtype=bool)
         self._update_hazards(predicate_audits)
         official_violations = (
@@ -1635,7 +1746,9 @@ class LiberoEnv(gym.Env):
             severe_collision_terminations=severe_collision_terminations,
         )
         infos = list_of_dict_to_dict_of_list(info_lists)
-        truncations = self.elapsed_steps >= self.cfg.max_episode_steps
+        truncations = (
+            self.elapsed_steps + self._cf_step_offset
+        ) >= self.cfg.max_episode_steps
         obs = None if _skip_obs_wrap else self._wrap_obs(raw_obs)
 
         step_reward = self._calc_step_reward(safe_goal_terminations)
@@ -1674,6 +1787,7 @@ class LiberoEnv(gym.Env):
                     emitted_termination=bool(terminations[env_id]),
                     truncated=bool(truncations[env_id]),
                     predicates=predicate_audits[env_id],
+                    fixture_qpos=fixture_qpos[env_id],
                 )
         restored_branches = self._advance_counterfactual_branches(
             raw_obs=raw_obs,
@@ -1711,11 +1825,15 @@ class LiberoEnv(gym.Env):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         if self.counterfactual_branch_collector is not None and chunk_size != 1:
-            raise ValueError(
-                "LIBERO counterfactual branching requires exactly one action per "
-                "policy chunk. Set rollout.model.num_action_chunks=1 so the policy "
-                "replans from the restored snapshot before executing a branch action."
-            )
+            # Program branches start only at chunk boundaries and restores are
+            # deferred to the chunk end, so the policy replans from the restored
+            # observation (P14). Preset strategies still branch at any step.
+            if self._cf_program is None or chunk_size != self._cf_chunk:
+                raise ValueError(
+                    "LIBERO counterfactual branching with preset strategies requires "
+                    "one action per policy chunk; with counterfactual_branch.program "
+                    f"the policy chunk must equal action_chunk={self._cf_chunk}."
+                )
         obs_list = []
         infos_list = []
 

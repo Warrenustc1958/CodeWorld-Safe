@@ -350,6 +350,7 @@ class LiberoSafetyEpisodeAuditor:
         mode: str = "official_eval",
         save_visual_observations: bool = False,
         visual_camera_keys: tuple[str, ...] = ("agentview_image",),
+        save_sim_state: bool = False,
     ) -> None:
         if mode not in AUDIT_MODES:
             raise ValueError(
@@ -378,6 +379,41 @@ class LiberoSafetyEpisodeAuditor:
         self._visual_frames: list[dict[str, list[np.ndarray]] | None] = [
             None
         ] * self.num_envs
+        # Per-chunk simulator snapshots (P1/P6), written to state/<id>.npz.
+        self.save_sim_state = bool(save_sim_state)
+        self._state_output_dir = self._output_dir / "state"
+        if self.save_sim_state:
+            self._state_output_dir.mkdir(parents=True, exist_ok=True)
+        self._sim_states: list[list[dict[str, Any]] | None] = [None] * self.num_envs
+        # Transitions of the most recently finalized episode per env (P2 guard).
+        self._last_finalized_steps: list[int | None] = [None] * self.num_envs
+
+    def saved_steps(self, env_idx: int) -> int | None:
+        """Transitions recorded so far for the active episode (None if idle)."""
+        self._check_env_idx(env_idx)
+        episode = self._episodes[env_idx]
+        return None if episode is None else len(episode["trajectory"])
+
+    def last_finalized_steps(self, env_idx: int) -> int | None:
+        """Transitions saved by the last episode this env finalized."""
+        self._check_env_idx(env_idx)
+        return self._last_finalized_steps[env_idx]
+
+    def record_sim_state(self, env_idx: int, timestep: int, snapshot: dict[str, Any]) -> None:
+        """Keep the simulator snapshot taken just before step ``timestep``.
+
+        Only snapshots taken right before the next unsaved step are kept, so
+        ``timesteps[k] - 1`` always indexes into the saved trajectory.
+        """
+        self._check_env_idx(env_idx)
+        if not self.save_sim_state or self._episodes[env_idx] is None:
+            return
+        if int(timestep) - 1 != len(self._episodes[env_idx]["trajectory"]):
+            return
+        buffer = self._sim_states[env_idx]
+        if buffer is None:
+            raise RuntimeError(f"Missing sim-state buffer for env_idx={env_idx}")
+        buffer.append({"timestep": int(timestep), **snapshot})
 
     def start_episode(
         self,
@@ -404,10 +440,13 @@ class LiberoSafetyEpisodeAuditor:
                 "env_index": env_idx,
                 "episode_index": episode_index,
                 "collection_mode": self.mode,
+                "alignment": "frame[t] + action[t] -> frame[t+1]",
+                "camera_keys": list(self.visual_camera_keys),
                 **_json_value(metadata),
             },
             "trajectory": [],
         }
+        self._sim_states[env_idx] = [] if self.save_sim_state else None
         if self.include_observations:
             episode["initial_observation"] = _non_visual_observation(
                 initial_observation
@@ -442,6 +481,7 @@ class LiberoSafetyEpisodeAuditor:
         emitted_termination: bool,
         truncated: bool,
         predicates: list[dict[str, Any]],
+        fixture_qpos: dict[str, Any] | None = None,
     ) -> Path | None:
         """Append one transition and finalize according to the audit mode."""
         self._check_env_idx(env_idx)
@@ -463,6 +503,8 @@ class LiberoSafetyEpisodeAuditor:
             },
             "predicates": _json_value(predicates),
         }
+        if fixture_qpos is not None:
+            transition["fixture_qpos"] = _json_value(fixture_qpos)
         if self.include_observations:
             transition["observation"] = _non_visual_observation(observation)
         episode["trajectory"].append(transition)
@@ -502,7 +544,10 @@ class LiberoSafetyEpisodeAuditor:
         if not trajectory:
             self._episodes[env_idx] = None
             self._visual_frames[env_idx] = None
+            self._sim_states[env_idx] = None
+            self._last_finalized_steps[env_idx] = 0
             return None
+        self._last_finalized_steps[env_idx] = len(trajectory)
 
         first_raw_success = next(
             (
@@ -611,6 +656,8 @@ class LiberoSafetyEpisodeAuditor:
                 "preprocessing": "rotate_180_to_rlinf_policy_view",
                 "alignment": "frame[t] + action[t] -> frame[t+1]",
             }
+        if self.save_sim_state:
+            self._write_sim_states(env_idx, episode, episode_id)
         output_path = self._output_dir / f"{episode_id}.json"
         temporary_path = output_path.with_suffix(".json.tmp")
         with temporary_path.open("w", encoding="utf-8") as file:
@@ -619,8 +666,56 @@ class LiberoSafetyEpisodeAuditor:
 
         self._episodes[env_idx] = None
         self._visual_frames[env_idx] = None
+        self._sim_states[env_idx] = None
         self._episode_indices[env_idx] += 1
         return output_path
+
+    def _write_sim_states(self, env_idx: int, episode: dict[str, Any], episode_id: str) -> None:
+        """Write the per-chunk snapshots as state/<id>.npz (no pickles)."""
+        states = self._sim_states[env_idx] or []
+        if not states:
+            raise RuntimeError(
+                f"save_sim_state is on but episode {episode_id} has no snapshots; "
+                "the env must call record_sim_state at every chunk boundary"
+            )
+        arrays: dict[str, np.ndarray] = {
+            "timesteps": np.asarray([s["timestep"] for s in states], dtype=np.int32),
+            "cur_time": np.asarray([s.get("cur_time", np.nan) for s in states], dtype=np.float64),
+            "motion_generators": np.asarray(
+                [json.dumps(_json_value(s.get("motion_generators", {}))) for s in states]
+            ),
+            "controller_state": np.asarray(
+                [json.dumps(_json_value(s.get("controller_state", []))) for s in states]
+            ),
+            "gripper_state": np.asarray(
+                [json.dumps(_json_value(s.get("gripper_state", []))) for s in states]
+            ),
+        }
+        for key in ("mujoco_state", "mocap_pos", "mocap_quat", "act", "ctrl",
+                    "qacc_warmstart", "qfrc_applied", "xfrc_applied"):
+            if all(key in s for s in states):
+                arrays[key] = np.stack([np.asarray(s[key]) for s in states], axis=0)
+        path = self._state_output_dir / f"{episode_id}.npz"
+        tmp = path.with_suffix(".npz.tmp")
+        with tmp.open("wb") as file:
+            np.savez_compressed(file, **arrays)
+        os.replace(tmp, path)
+        episode["sim_state_trajectory"] = {
+            "format": "npz",
+            "path": f"state/{path.name}",
+            "num_snapshots": len(states),
+            "timesteps": arrays["timesteps"].tolist(),
+            "fields": sorted(arrays),
+            "semantics": "snapshot k is the state right before step timesteps[k]",
+        }
+        first = states[0]
+        if first["timestep"] == 1 and "mocap_pos" in first:
+            # Dynamic-obstacle origin as actually re-sampled at reset (P7).
+            episode["mocap_start"] = {
+                "mocap_pos": _json_value(first["mocap_pos"]),
+                "mocap_quat": _json_value(first.get("mocap_quat")),
+                "motion_generators": _json_value(first.get("motion_generators", {})),
+            }
 
     def _extract_visual_frames(self, observation: Any) -> dict[str, np.ndarray]:
         """Extract policy-view RGB frames and fail fast on incomplete data."""

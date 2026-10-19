@@ -260,6 +260,73 @@ def _checked_snapshot_array(
     return array.copy()
 
 
+_CONTROLLER_SCALARS = (bool, int, float, np.bool_, np.integer, np.floating)
+
+
+def _controller_state(task_env) -> list[dict[str, Any]]:
+    """Plain-data attributes of every robot arm controller (OSC goal, cached kinematics).
+
+    MjSimState does not hold controller memory. Without it a restored branch
+    runs its first action against the goal pose left by whatever ran before the
+    restore, so replay from a snapshot diverged in the first chunk (P6).
+    """
+    states = []
+    for robot in getattr(task_env, "robots", []) or []:
+        controller = getattr(robot, "controller", None)
+        state: dict[str, Any] = {}
+        for key, value in vars(controller).items() if controller is not None else ():
+            if isinstance(value, np.ndarray) or isinstance(value, _CONTROLLER_SCALARS):
+                state[key] = copy.deepcopy(value)
+            elif value is None:
+                state[key] = None
+        states.append(state)
+    return states
+
+
+def _restore_controller_state(task_env, states: list[dict[str, Any]]) -> None:
+    for robot, state in zip(getattr(task_env, "robots", []) or [], states):
+        controller = getattr(robot, "controller", None)
+        if controller is None:
+            continue
+        for key, value in state.items():
+            if hasattr(controller, key):
+                setattr(controller, key, copy.deepcopy(value))
+
+
+def _robot_grippers(robot) -> list[Any]:
+    grippers = getattr(robot, "gripper", None)
+    if grippers is None:
+        return []
+    return list(grippers.values()) if isinstance(grippers, dict) else [grippers]
+
+
+def _gripper_state(task_env) -> list[list[dict[str, Any]]]:
+    """robosuite grippers integrate ``current_action`` across steps.
+
+    It is neither in MjSimState nor in the arm controller, so a restored state
+    replayed its first chunk with the finger command left by the previous run
+    (measured: finger qvel off by ~0.008, qpos by up to 0.08 after 8 steps).
+    """
+    out = []
+    for robot in getattr(task_env, "robots", []) or []:
+        out.append([
+            {
+                key: copy.deepcopy(value)
+                for key, value in vars(gripper).items()
+                if isinstance(value, np.ndarray) or isinstance(value, _CONTROLLER_SCALARS)
+            }
+            for gripper in _robot_grippers(robot)
+        ])
+    return out
+
+
+def _restore_gripper_state(task_env, states: list[list[dict[str, Any]]]) -> None:
+    for robot, robot_states in zip(getattr(task_env, "robots", []) or [], states):
+        for gripper, state in zip(_robot_grippers(robot), robot_states):
+            for key, value in state.items():
+                setattr(gripper, key, copy.deepcopy(value))
+
+
 def _snapshot_simulator_state(env) -> dict[str, Any]:
     """Capture MuJoCo and LIBERO dynamic-obstacle state for branching."""
     task_env = _unwrap_task_env(env)
@@ -284,6 +351,8 @@ def _snapshot_simulator_state(env) -> dict[str, Any]:
             name: copy.deepcopy(generator.__dict__)
             for name, generator in generators.items()
         },
+        "controller_state": _controller_state(task_env),
+        "gripper_state": _gripper_state(task_env),
     }
     # MjSimState only contains time/qpos/qvel.  Preserve the remaining mutable
     # integration inputs used by controllers so a branch starts from the same
@@ -309,6 +378,26 @@ def _snapshot_simulator_state(env) -> dict[str, Any]:
             f"snapshot ok timestep={timestep} state_size={state.size}"
         )
     return snapshot
+
+
+def _fixture_joint_qpos(env) -> dict[str, Any]:
+    """Joint positions of every articulated fixture (microwave door, stove knob).
+
+    Audits store free-joint object poses but not hinge/slide fixture joints, so
+    articulated tasks could not be re-rendered offline (P5). Joint names come
+    from the fixture models, exactly as LIBERO's Open/Close/TurnOn states read them.
+    """
+    task_env = _unwrap_task_env(env)
+    sim = task_env.sim
+    out: dict[str, Any] = {}
+    for fixture in (getattr(task_env, "fixtures_dict", None) or {}).values():
+        for joint in getattr(fixture, "joints", None) or []:
+            addr = sim.model.get_joint_qpos_addr(joint)
+            if isinstance(addr, tuple):
+                out[str(joint)] = [float(v) for v in sim.data.qpos[addr[0] : addr[1]]]
+            else:
+                out[str(joint)] = float(sim.data.qpos[addr])
+    return out
 
 
 def _restore_simulator_state(env, snapshot: dict[str, Any]):
@@ -364,6 +453,10 @@ def _restore_simulator_state(env, snapshot: dict[str, Any]):
     if "cur_time" in snapshot:
         task_env.cur_time = float(snapshot["cur_time"])
     sim.forward()
+    if "controller_state" in snapshot:
+        _restore_controller_state(task_env, snapshot["controller_state"])
+    if "gripper_state" in snapshot:
+        _restore_gripper_state(task_env, snapshot["gripper_state"])
     task_env._post_process()
     # Drop samples and sampling clocks from the future root / previous branch.
     # Reusing that cache makes a restored physics state appear to have a stale
@@ -455,6 +548,7 @@ def _worker(
                     env_return = list(env_return)
                     info = dict(env_return[3])
                     info["_libero_safety_predicates"] = audit_predicate_instances(env)
+                    info["_libero_fixture_qpos"] = _fixture_joint_qpos(env)
                     env_return[3] = info
                     env_return = tuple(env_return)
                 if obs_bufs is not None:

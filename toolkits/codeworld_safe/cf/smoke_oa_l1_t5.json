@@ -1,0 +1,25 @@
+{
+  "program_id": "smoke_oa_l1_t5_servo_toy_car",
+  "cell": {"suite": "obstacle_avoidance", "level": "L1", "task_id": 5},
+  "target_quadrant": "Q4",
+  "scene": {"mutations": []},
+  "branch": {
+    "root_quadrants": ["Q1", "Q3"],
+    "trigger": {
+      "phase": "any",
+      "cond": "min_dist(ee,hazard) < 0.12",
+      "hazard": "toy_car_1",
+      "fallback": "risk_weighted"
+    },
+    "events": [
+      {"op": "servo_toward", "target": "hazard", "steps": "$steps", "gain": "$gain", "gripper": "policy"}
+    ],
+    "handback": "policy"
+  },
+  "params": {
+    "steps": {"dist": "uniform", "low": 2, "high": 4},
+    "gain": {"dist": "uniform", "low": 0.6, "high": 0.9}
+  },
+  "extra_predicates": [],
+  "rationale": "Step B smoke: short directed push toward the moving toy car, then hand back to the policy."
+}

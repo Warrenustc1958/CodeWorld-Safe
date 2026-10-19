@@ -120,6 +120,7 @@ def test_builder_exports_aligned_wan_and_sam_data(tmp_path: Path):
 
     output = tmp_path / "dataset"
     summary = build_dataset(
+        min_frames=1,
         audit_roots=[audit_root],
         output_dir=output,
         quadrants=("Q1", "Q2"),
@@ -238,6 +239,7 @@ def test_builder_rejects_mismatched_branch_seam_and_missing_root(tmp_path: Path)
     assert _record(auditor, 1, violation=True, success=True) is not None
     with pytest.raises(ValueError, match="root/branch pairing is inconsistent"):
         build_dataset(
+            min_frames=1,
             audit_roots=[audit_root],
             output_dir=tmp_path / "dataset",
             train_fraction=1.0,
@@ -266,9 +268,11 @@ def test_builder_rejects_mismatched_branch_seam_and_missing_root(tmp_path: Path)
     assert _record(orphan, 1, violation=True, success=True) is not None
     with pytest.raises(ValueError, match="not found under the audit roots"):
         build_dataset(
+            min_frames=1,
             audit_roots=[orphan_root], output_dir=tmp_path / "d2", dry_run=True
         )
     summary = build_dataset(
+        min_frames=1,
         audit_roots=[orphan_root],
         output_dir=tmp_path / "d2",
         stitch_branches=False,
@@ -292,6 +296,7 @@ def test_builder_refuses_missing_visual_sidecar_and_quadrant_shortfall(
 
     with pytest.raises(ValueError, match="no visual_trajectory"):
         build_dataset(
+            min_frames=1,
             audit_roots=[audit_root],
             output_dir=tmp_path / "dataset",
             quadrants=("Q1",),
@@ -310,6 +315,7 @@ def test_builder_refuses_missing_visual_sidecar_and_quadrant_shortfall(
     assert _record(visual_auditor, 1, violation=False, success=True) is not None
     with pytest.raises(ValueError, match="shortfalls"):
         build_dataset(
+            min_frames=1,
             audit_roots=[visual_root],
             output_dir=tmp_path / "dataset",
             quadrants=("Q1", "Q2"),
@@ -330,6 +336,7 @@ def test_builder_refuses_missing_visual_sidecar_and_quadrant_shortfall(
     second_auditor.start_episode(0, _metadata(), _observation(0))
     assert _record(second_auditor, 1, violation=False, success=True) is not None
     summary = build_dataset(
+        min_frames=1,
         audit_roots=[tmp_path / "multi_run_audits"],
         output_dir=tmp_path / "dataset",
         quadrants=("Q1",),
