@@ -82,6 +82,8 @@ def _predicate_argument(value: Any) -> Any:
 
 
 AUX_SAFETY_ENV_VAR = "RLINF_LIBERO_SAFETY_AUX"
+# Opt-in per-step continuous safety grades (safety_grader.py) in the env worker.
+GRADES_ENV_VAR = "RLINF_LIBERO_SAFETY_GRADES"
 AUX_CONSTRAINT_SOURCE = "aux_constraint"
 # Argument index of the hazard object for each violation predicate.
 _HAZARD_ARGUMENT = {
@@ -482,6 +484,7 @@ class LiberoSafetyEpisodeAuditor:
         truncated: bool,
         predicates: list[dict[str, Any]],
         fixture_qpos: dict[str, Any] | None = None,
+        grades: list[dict[str, Any]] | None = None,
     ) -> Path | None:
         """Append one transition and finalize according to the audit mode."""
         self._check_env_idx(env_idx)
@@ -505,6 +508,9 @@ class LiberoSafetyEpisodeAuditor:
         }
         if fixture_qpos is not None:
             transition["fixture_qpos"] = _json_value(fixture_qpos)
+        if grades is not None:
+            # c_obj / c_robot / c_grasp with min_dist, normal_force, near_miss (P12).
+            transition["grades"] = _json_value(grades)
         if self.include_observations:
             transition["observation"] = _non_visual_observation(observation)
         episode["trajectory"].append(transition)

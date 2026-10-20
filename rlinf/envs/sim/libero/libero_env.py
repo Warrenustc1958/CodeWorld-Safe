@@ -43,6 +43,7 @@ from rlinf.envs.sim.libero.safety_auditor import (
     AUDIT_MODES,
     AUX_CONSTRAINT_SOURCE,
     AUX_SAFETY_ENV_VAR,
+    GRADES_ENV_VAR,
     LiberoSafetyEpisodeAuditor,
     detect_severe_collisions,
     select_emitted_terminations,
@@ -519,14 +520,24 @@ class LiberoEnv(gym.Env):
         # (venv.py), so the opt-in flag must be exported there. ``_init_env``
         # runs before the auditor config is parsed, hence the direct select.
         aux_flag = "1" if _aux_safety_requested(self.cfg) else "0"
+        # Per-step continuous safety grades (safety_grader.py), opt-in.
+        grades_flag = (
+            "1"
+            if bool(OmegaConf.select(self.cfg, "episode_auditor.save_grades", default=False))
+            else "0"
+        )
 
         for env_fn_param in env_fn_params:
 
             def env_fn(
-                param=env_fn_param, _type_val=current_type_val, _aux_flag=aux_flag
+                param=env_fn_param,
+                _type_val=current_type_val,
+                _aux_flag=aux_flag,
+                _grades_flag=grades_flag,
             ):
                 os.environ["LIBERO_TYPE"] = _type_val
                 os.environ[AUX_SAFETY_ENV_VAR] = _aux_flag
+                os.environ[GRADES_ENV_VAR] = _grades_flag
                 seed = param.pop("seed")
 
                 if _type_val in ["pro", "plus"]:
@@ -1704,6 +1715,7 @@ class LiberoEnv(gym.Env):
             info.pop("_libero_safety_predicates", []) for info in info_lists
         ]
         fixture_qpos = [info.pop("_libero_fixture_qpos", None) for info in info_lists]
+        safety_grades = [info.pop("_libero_safety_grades", None) for info in info_lists]
         raw_goal_terminations = np.asarray(goal_terminations, dtype=bool)
         self._update_hazards(predicate_audits)
         official_violations = (
@@ -1788,6 +1800,7 @@ class LiberoEnv(gym.Env):
                     truncated=bool(truncations[env_id]),
                     predicates=predicate_audits[env_id],
                     fixture_qpos=fixture_qpos[env_id],
+                    grades=safety_grades[env_id],
                 )
         restored_branches = self._advance_counterfactual_branches(
             raw_obs=raw_obs,

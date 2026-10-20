@@ -24,7 +24,11 @@ from typing import Any, Callable, Optional, Union
 import gym
 import numpy as np
 
-from rlinf.envs.sim.libero.safety_auditor import audit_predicate_instances
+from rlinf.envs.sim.libero.safety_auditor import (
+    AUX_SAFETY_ENV_VAR,
+    GRADES_ENV_VAR,
+    audit_predicate_instances,
+)
 from rlinf.envs.sim.libero.utils import get_libero_type
 from rlinf.envs.venv import (
     BaseVectorEnv,
@@ -400,6 +404,23 @@ def _fixture_joint_qpos(env) -> dict[str, Any]:
     return out
 
 
+def _safety_grades(env) -> list[dict[str, Any]]:
+    """Per-step continuous grades; graders are rebuilt when the model changes (reconfigure)."""
+    from rlinf.envs.sim.libero.safety_grader import build_graders, grade_step
+
+    task_env = _unwrap_task_env(env)
+    cache = getattr(task_env, "_rlinf_safety_graders", None)
+    if cache is None or cache[0] is not task_env.sim.model:
+        graders = build_graders(
+            task_env,
+            task_env.parsed_problem,
+            aux=os.environ.get(AUX_SAFETY_ENV_VAR, "0") == "1",
+        )
+        cache = (task_env.sim.model, graders)
+        task_env._rlinf_safety_graders = cache
+    return grade_step(cache[1], task_env)
+
+
 def _restore_simulator_state(env, snapshot: dict[str, Any]):
     """Restore a branching snapshot and regenerate the corresponding observation."""
     task_env = _unwrap_task_env(env)
@@ -549,6 +570,8 @@ def _worker(
                     info = dict(env_return[3])
                     info["_libero_safety_predicates"] = audit_predicate_instances(env)
                     info["_libero_fixture_qpos"] = _fixture_joint_qpos(env)
+                    if os.environ.get(GRADES_ENV_VAR, "0") == "1":
+                        info["_libero_safety_grades"] = _safety_grades(env)
                     env_return[3] = info
                     env_return = tuple(env_return)
                 if obs_bufs is not None:
