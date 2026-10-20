@@ -1544,6 +1544,7 @@ class LiberoEnv(gym.Env):
         """Capture root snapshots and inject a branch's first perturbed action."""
         collector = self.counterfactual_branch_collector
         if collector is None:
+            self._record_sim_states_without_collector()
             return actions
 
         prepared_actions = np.asarray(actions).copy()
@@ -1603,6 +1604,26 @@ class LiberoEnv(gym.Env):
                     env_id, int(self.elapsed_steps[env_id]) + 1, snapshots[env_id]
                 )
         return prepared_actions
+
+    def _record_sim_states_without_collector(self):
+        """Sidecar snapshots for root-only collection (no counterfactual collector).
+
+        Same chunk-boundary rule as the collector path, so these roots can be
+        branched later and pass the gate-4 seam check.
+        """
+        auditor = self.episode_auditor
+        if auditor is None or not auditor.save_sim_state:
+            return
+        ids = [
+            env_id
+            for env_id in range(self.num_envs)
+            if auditor.saved_steps(env_id) is not None
+            and int(self.elapsed_steps[env_id]) % self._sim_state_chunk == 0
+        ]
+        if not ids:
+            return
+        for env_id, snapshot in zip(ids, self.env.snapshot_simulator_state(id=ids)):
+            auditor.record_sim_state(env_id, int(self.elapsed_steps[env_id]) + 1, snapshot)
 
     def _current_eef_pos(self, env_id: int):
         """End-effector position of the observation the next action acts on."""

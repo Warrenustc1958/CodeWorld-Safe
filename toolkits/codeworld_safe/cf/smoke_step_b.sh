@@ -14,7 +14,7 @@ MODEL=${MODEL:-/mnt/nfs/fjj/Models/RLinf-OpenVLAOFT-LIBERO-130}
 UNNORM=${UNNORM:-libero_130_no_noops_trajall}
 PROGRAM=${PROGRAM:-$REPO/toolkits/codeworld_safe/cf/smoke_oa_l1_t5.json}
 KNOWLEDGE=$REPO/toolkits/codeworld_safe/agent/knowledge
-OUT=${OUT:-$R/rollouts/cws_smoke/oa_L1_t5_$(date +%m%d_%H%M)}
+OUT=${OUT:-${CWS_DATA:-/data_cf/cws}/rollouts/cws_smoke/oa_L1_t5_$(date +%m%d_%H%M)}
 EPISODE_STEPS=512
 MAX_ROLLOUT_STEPS=$(((MAX_BRANCHES + 1) * EPISODE_STEPS))
 mkdir -p "$OUT"

@@ -6,7 +6,8 @@
 set -uo pipefail
 R=/mnt/nfs/fjj/Code/rlinf-safety-runtime
 REPO=/mnt/nfs/fjj/Code/CodeWorld-Safe
-ARCHIVE=${ARCHIVE:-$R/tmp/cws_archive_d1}
+CWS_DATA=${CWS_DATA:-/data_cf/cws}
+ARCHIVE=${ARCHIVE:-$CWS_DATA/archive/cws_archive_d1}
 PY=$R/.venv-openpi-libero-safety/bin/python
 GPU=${GPU:-7}; ENVS=${ENVS:-4}; MAX_BRANCHES=${MAX_BRANCHES:-4}
 mkdir -p "$ARCHIVE/programs"
@@ -25,7 +26,7 @@ open(sys.argv[3], "w").write(json.dumps(rec.program, indent=1))
 c = rec.program["cell"]; print(c["suite"], c["level"], c["task_id"])
 EOF
     read -r SUITE LEVEL TASK < <(PYTHONPATH=. "$PY" -c "import json;c=json.load(open('$P'))['cell'];print(c['suite'],c['level'],c['task_id'])")
-    OUT="$R/rollouts/cws_trial_pi05/${SUITE}_${LEVEL}_t${TASK}_${pid}_$(date +%m%d_%H%M)"
+    OUT="$CWS_DATA/rollouts/cws_trial_pi05/${SUITE}_${LEVEL}_t${TASK}_${pid}_$(date +%m%d_%H%M)"
     SUITE=$SUITE LEVEL=$LEVEL TASK=$TASK PROGRAM=$P GPU=$GPU ENVS=$ENVS MAX_BRANCHES=$MAX_BRANCHES OUT=$OUT \
       bash "$REPO/toolkits/codeworld_safe/cf/trial_pi05.sh"
     PYTHONPATH=. OMP_NUM_THREADS=2 "$PY" -m toolkits.codeworld_safe.agent.ingest --audits "$OUT" --archive "$ARCHIVE" 2>&1 \

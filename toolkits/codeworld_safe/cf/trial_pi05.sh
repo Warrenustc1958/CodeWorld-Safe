@@ -10,7 +10,8 @@ SUITE=${SUITE:?}; LEVEL=${LEVEL:?}; TASK=${TASK:?}; PROGRAM=${PROGRAM:?}
 GPU=${GPU:-7}; ENVS=${ENVS:-4}; MAX_BRANCHES=${MAX_BRANCHES:-4}; SEED=${SEED:-0}
 EPISODE_STEPS=512
 MAX_ROLLOUT_STEPS=$(((MAX_BRANCHES + 1) * EPISODE_STEPS))
-OUT=${OUT:-$R/rollouts/cws_trial_pi05/${SUITE}_${LEVEL}_t${TASK}_$(basename "$PROGRAM" .json)_$(date +%m%d_%H%M)}
+CWS_DATA=${CWS_DATA:-/data_cf/cws}
+OUT=${OUT:-$CWS_DATA/rollouts/cws_trial_pi05/${SUITE}_${LEVEL}_t${TASK}_$(basename "$PROGRAM" .json)_$(date +%m%d_%H%M)}
 mkdir -p "$OUT"
 IM=$R/local-packages/imagemagick/prefix
 export MAGICK_HOME=$IM/usr LD_LIBRARY_PATH=${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$IM/usr/lib/x86_64-linux-gnu
