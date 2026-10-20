@@ -86,10 +86,21 @@ def _min_distance(task_env, set_a: Sequence[int], set_b: Sequence[int]) -> float
     import mujoco
 
     m, d = _raw(task_env)
+    a, b = set(set_a), set(set_b)
+    # Pairs in the active contact list; only these may legitimately report 0.0.
+    in_contact = set()
+    for i in range(d.ncon):
+        c = d.contact[i]
+        if (c.geom1 in a and c.geom2 in b) or (c.geom1 in b and c.geom2 in a):
+            in_contact.add((min(c.geom1, c.geom2), max(c.geom1, c.geom2)))
     best = DIST_MAX
     for ga in set_a:
         for gb in set_b:
             dist = float(mujoco.mj_geomDistance(m, d, int(ga), int(gb), DIST_MAX, None))
+            # MuJoCo 3.8.1 returns exactly 0.0 for a few separated mesh-mesh pairs
+            # (smoke L0 2026-10-20: 3/2928 pairs, real gap 0.15-0.42 m). Drop those.
+            if dist == 0.0 and (min(ga, gb), max(ga, gb)) not in in_contact:
+                continue
             if dist < best:
                 best = dist
     return best
