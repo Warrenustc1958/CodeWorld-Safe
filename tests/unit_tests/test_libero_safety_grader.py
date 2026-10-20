@@ -70,7 +70,12 @@ def test_graders_match_audited_predicates(task, monkeypatch):
                     continue
                 g = grades.get(rec["instance_id"])
                 assert g is not None, f"no grader for {rec['instance_id']} {rec['predicate']}"
-                assert g["violated"] == bool(rec["value"]), (rec, g)
+                if rec["predicate"].lower() == "checkrobotcontact":
+                    # LIBERO's check_robot_contact compares geom names with integer ids
+                    # and never fires; the grader may only add detections, never drop one.
+                    assert g["violated"] or not rec["value"], (rec, g)
+                else:
+                    assert g["violated"] == bool(rec["value"]), (rec, g)
                 assert np.isfinite(g["min_dist"]) and g["normal_force"] >= 0.0
                 if g["violated"] and g["channel"] != "c_grasp":
                     assert g["min_dist"] <= 1e-3 and not g["near_miss"]

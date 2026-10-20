@@ -362,6 +362,26 @@ class LiberoEnv(gym.Env):
         )
         # Steps a program branch inherits from its root (P8); 0 for roots/legacy.
         self._cf_step_offset = np.zeros(self.num_envs, dtype=np.int32)
+        # LIBERO-Safety's checkrobotcontact never fires (it compares geom names
+        # against integer geom ids), so shadow collection can label episodes with
+        # the geom-id based safety graders instead. Labels only: no hard stop,
+        # and the official protocol is untouched.
+        save_grades = bool(auditor_cfg.get("save_grades", False)) if auditor_cfg is not None else False
+        self.grades_count_as_unsafe = bool(
+            auditor_cfg.get(
+                "grades_count_as_unsafe",
+                save_grades and self.episode_auditor_mode == "shadow_collect",
+            )
+            if auditor_cfg is not None
+            else False
+        )
+        if self.grades_count_as_unsafe and not save_grades:
+            raise ValueError("grades_count_as_unsafe requires episode_auditor.save_grades=true")
+        if self.grades_count_as_unsafe and self.episode_auditor_mode != "shadow_collect":
+            raise ValueError(
+                "grades_count_as_unsafe changes safety labels; it requires "
+                "episode_auditor.mode=shadow_collect"
+            )
         self.counterfactual_branch_collector = None
         self._defer_counterfactual_restore = False
         self._pending_counterfactual_restores = [None] * self.num_envs
@@ -1729,6 +1749,11 @@ class LiberoEnv(gym.Env):
             # (quadrants, metrics, audit) but never cause a hard stop.
             constraint_violations = official_violations | self._constraint_violations(
                 predicate_audits, info_lists, sources=(AUX_CONSTRAINT_SOURCE,)
+            )
+        if self.libero_type == "safety" and self.grades_count_as_unsafe:
+            constraint_violations = constraint_violations | np.asarray(
+                [any(g.get("violated") for g in (grades or [])) for grades in safety_grades],
+                dtype=bool,
             )
         severe_collision_terminations, self.consecutive_violation_steps = (
             detect_severe_collisions(
