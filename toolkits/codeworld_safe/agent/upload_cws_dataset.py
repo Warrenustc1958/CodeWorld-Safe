@@ -121,9 +121,21 @@ def stage_static():
 
 
 def stage_step_e():
+    """Only runs the collector finished (listed in outcomes.jsonl); interrupted rounds are skipped."""
+    known = set()
+    for l in (STEP_E / "archive" / "outcomes.jsonl").read_text().splitlines():
+        o = json.loads(l)
+        known.add((o["cell"], o["run"]))
     cells = sorted(p.name for p in (STEP_E / "runs").iterdir() if p.is_dir())
+    skipped = []
     for c in cells:
-        mirror(STEP_E / "runs" / c, STAGE / "step_e" / "runs" / c)
+        for run in sorted(p for p in (STEP_E / "runs" / c).iterdir() if p.is_dir()):
+            if (c, run.name) in known:
+                mirror(run, STAGE / "step_e" / "runs" / c / run.name)
+            else:
+                skipped.append(f"{c}/{run.name}")
+    if skipped:
+        say(f"skipped {len(skipped)} runs not in outcomes.jsonl: {skipped[:5]}")
     for name in ("outcomes.jsonl",):
         link(STAGE / "step_e" / "archive" / name, STEP_E / "archive" / name)
     for name in ("state.json", "report.json", "gaps.json", "campaign.log"):
