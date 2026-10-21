@@ -61,8 +61,16 @@ def counts(archive: Archive, cell: str) -> dict[str, int]:
     return out
 
 
-def gaps(c: dict[str, int]) -> dict[str, int]:
-    return {q: max(0, QUOTA[q] - c.get(q, 0)) for q in QUOTA}
+def quota(cell: str) -> dict[str, int]:
+    # Affordance: no NM quota. Its hazard is c_grasp, and fingerpad-to-wrong-part distance
+    # is fixed by tool geometry, not risk (verify_grasp_nm.py, 10.20: plans A/B unusable).
+    if cell.startswith("affordance_"):
+        return {**QUOTA, "NM": 0}
+    return QUOTA
+
+
+def gaps(c: dict[str, int], cell: str) -> dict[str, int]:
+    return {q: max(0, n - c.get(q, 0)) for q, n in quota(cell).items()}
 
 
 def _has_wrist(visual_path: Path) -> bool:
@@ -149,7 +157,7 @@ def infeasible_reason(archive: Archive, cell: str, c: dict[str, int]) -> str:
     trig = sum(bool(o.get("trigger_hit")) for o in br) / len(br) if br else 0.0
     dup = sum(o["duplicate"] for o in rows) / len(rows) if rows else 0.0
     progs = len(archive.programs(cell, status="validated"))
-    unmet = {k: v for k, v in gaps(c).items() if v}
+    unmet = {k: v for k, v in gaps(c, cell).items() if v}
     return (f"unmet {unmet}; root success {succ:.2f} over {len(roots)} roots; "
             f"median root min hazard dist {np.median(md) if md else float('nan'):.3f} m; "
             f"{len(br)} branches, trigger hit {trig:.2f}; duplicate share {dup:.2f}; {progs} validated programs")
@@ -174,7 +182,7 @@ def report(root: Path, archive: Archive, state: dict) -> dict:
         steps_c = sum(int(o.get("steps", 0)) for o in archive.outcomes(cell=cell))
         steps += steps_c
         unsafe += c["Q2"] + c["Q4"]
-        rate = float(np.mean([min(1.0, c[q] / QUOTA[q]) for q in QUOTA]))
+        rate = float(np.mean([min(1.0, c[q] / n) for q, n in quota(cell).items() if n]))
         rows[cell] = {**c, "quota_rate": round(rate, 3), "steps": steps_c,
                       "status": state.get(cell, {}).get("status", "active"),
                       "reason": state.get(cell, {}).get("reason", "")}
@@ -183,7 +191,7 @@ def report(root: Path, archive: Archive, state: dict) -> dict:
            "total_sim_steps": steps, "unsafe_admitted": unsafe,
            "unsafe_per_10k_steps": round(1e4 * unsafe / steps, 2) if steps else None, "cells": rows}
     (root / "report.json").write_text(json.dumps(rep, indent=1))
-    gp = {cell: {q: g for q, g in gaps(counts(archive, cell)).items() if q in ("Q1", "Q2", "Q3", "Q4")}
+    gp = {cell: {q: g for q, g in gaps(counts(archive, cell), cell).items() if q in ("Q1", "Q2", "Q3", "Q4")}
           for cell in all_cells() if state.get(cell, {}).get("status") in ("needs_program", "active")}
     (root / "gaps.json").write_text(json.dumps(gp, indent=1))
     return rep
@@ -230,7 +238,7 @@ def main() -> None:
                 continue
             archive = Archive(adir)  # reload: programs may be added by run_gen_round meanwhile
             c = counts(archive, cell)
-            gap = gaps(c)
+            gap = gaps(c, cell)
             pid = pick_program(archive, prior, cell, gap)
             if pid is None and not any(gap[q] for q in ("Q1", "Q3", "NM")):
                 st.update(status="needs_program", reason=f"only {[q for q in UNSAFE if gap[q]]} missing, no validated program")
@@ -257,13 +265,13 @@ def main() -> None:
                 rc = "timeout"
             stats = ingest_run(out, archive, cell, run_id) if out.exists() else {}
             c2 = counts(archive, cell)
-            grew = any(min(c2[q], QUOTA[q]) > min(c[q], QUOTA[q]) for q in QUOTA)
+            grew = any(min(c2[q], n) > min(c[q], n) for q, n in quota(cell).items())
             st["rounds"] = rnd + 1
             st["stagnant"] = 0 if grew else st["stagnant"] + 1
             st["runs"].append({"run": run_id, "program": pid, "rc": rc, "seconds": round(time.time() - t0),
                                "stats": stats, "counts": c2})
             say(f"  rc={rc} {round(time.time() - t0)}s stats={stats} counts={c2}")
-            if not any(gaps(c2).values()):
+            if not any(gaps(c2, cell).values()):
                 write_manifest(archive, cell, root / "runs" / cell)
                 st["status"] = "pending_upload"
                 tok = os.environ.get("MS_TOKEN_FILE", "")
