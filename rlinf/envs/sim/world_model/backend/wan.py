@@ -65,10 +65,18 @@ class WanBackend:
                 checkpoint_path=cfg.reward_model.from_pretrained,
                 task_suite_name=cfg.task_suite_name,
             )
+        if cfg.reward_model.type == "CWSRewardModel":
+            # Task vocabulary and view count come from the checkpoint
+            from rlinf.models.embodiment.reward.cws_reward_model import CWSRewardModel
+
+            return CWSRewardModel.from_checkpoint(
+                cfg.reward_model.from_pretrained,
+                binarize=cfg.reward_model.get("binarize", False),
+            )
         raise ValueError(f"Unknown reward model type: {cfg.reward_model.type}")
 
     def reward_instructions(self, env) -> Optional[list[str]]:
-        if env.cfg.reward_model.type != "TaskEmbedResnetRewModel":
+        if env.cfg.reward_model.type not in ("TaskEmbedResnetRewModel", "CWSRewardModel"):
             return None
         # One instruction per scored frame, so each description repeats over its chunk
         instructions = []
