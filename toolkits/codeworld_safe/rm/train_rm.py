@@ -33,12 +33,26 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 
 from rlinf.models.embodiment.reward.cws_reward_model import CWSRewardModel
 from toolkits.codeworld_safe.rm.data import RMFrames
 
 QUADRANTS = ("Q1", "Q2", "Q3", "Q4")
+
+
+class _Indexed(torch.utils.data.Dataset):
+    """Replace the per-set index returned by RMFrames with the global ConcatDataset index."""
+
+    def __init__(self, ds):
+        self.ds = ds
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, i):
+        x, y, t, _ = self.ds[i]
+        return x, y, t, i
 
 
 def augment(x: torch.Tensor, shift_px: int = 4, bright: float = 0.1, contrast: float = 0.1):
@@ -154,6 +168,10 @@ def main():
     ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--warmup", type=int, default=500)
     ap.add_argument("--pos_weight_cap", type=float, default=0.0, help="0 = uncapped neg/pos")
+    ap.add_argument("--extra_frac", type=float, default=0.0,
+                    help="sample --extra_train frames as this fraction of each epoch (0 = plain shuffle by size)")
+    ap.add_argument("--domain_pos_weight", action="store_true",
+                    help="pos_weight = neg/pos computed per train set instead of over the union")
     ap.add_argument("--no_aug", action="store_true")
     ap.add_argument("--val_splits", nargs="+", default=["val", "newval"])
     ap.add_argument("--test_splits", nargs="+", default=["test", "newtest"])
@@ -200,34 +218,55 @@ def main():
             raise ValueError(f"{root} has a different task vocabulary")
         train_sets.append(RMFrames(root, split, args.views))
     labels = np.concatenate([d.meta["label"] for d in train_sets])
+    domain = np.concatenate([np.full(len(d), k, np.int64) for k, d in enumerate(train_sets)])
     pos, neg = int(labels.sum()), int((~labels).sum())
-    pos_weight = neg / max(pos, 1)
-    if args.pos_weight_cap > 0:
-        pos_weight = min(pos_weight, args.pos_weight_cap)
+
+    def capped(n_neg, n_pos):
+        w = n_neg / max(n_pos, 1)
+        return min(w, args.pos_weight_cap) if args.pos_weight_cap > 0 else w
+
+    if args.domain_pos_weight:
+        dom_pw = [capped(int((~d.meta["label"]).sum()), int(d.meta["label"].sum())) for d in train_sets]
+    else:
+        dom_pw = [capped(neg, pos)] * len(train_sets)
     val_sets = {s: RMFrames(frames, s, args.views) for s in args.val_splits}
-    log(f"views={args.views} train frames={len(labels)} pos={pos} neg={neg} pos_weight={pos_weight:.1f} "
+    log(f"views={args.views} train frames={len(labels)} pos={pos} neg={neg} "
+        f"per-set frames/pos={[(len(d), int(d.meta['label'].sum())) for d in train_sets]} "
+        f"pos_weight={[round(w, 1) for w in dom_pw]} extra_frac={args.extra_frac} "
         f"val={ {s: len(d) for s, d in val_sets.items()} }")
 
     g = torch.Generator().manual_seed(args.seed)
-    loader = DataLoader(ConcatDataset(train_sets), batch_size=args.bs, shuffle=True, drop_last=True,
-                        num_workers=args.workers, pin_memory=True, persistent_workers=True,
-                        prefetch_factor=4, generator=g)
+    train_ds = _Indexed(ConcatDataset(train_sets))
+    if args.extra_frac > 0 and len(train_sets) > 1:
+        # real set gets 1 - extra_frac of the draws, extra sets share extra_frac by size; epoch length unchanged
+        n_real, n_extra = len(train_sets[0]), len(labels) - len(train_sets[0])
+        w = np.where(domain == 0, (1 - args.extra_frac) / n_real, args.extra_frac / n_extra)
+        sampler = WeightedRandomSampler(torch.from_numpy(w), num_samples=len(labels), replacement=True,
+                                        generator=g)
+        loader = DataLoader(train_ds, batch_size=args.bs, sampler=sampler, drop_last=True,
+                            num_workers=args.workers, pin_memory=True, persistent_workers=True, prefetch_factor=4)
+    else:
+        loader = DataLoader(train_ds, batch_size=args.bs, shuffle=True, drop_last=True,
+                            num_workers=args.workers, pin_memory=True, persistent_workers=True,
+                            prefetch_factor=4, generator=g)
     total = args.epochs * len(loader)
     if args.max_steps:
         total = min(total, args.max_steps)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / args.warmup) * 0.5 * (1 + math.cos(math.pi * min(s, total) / total)))
-    pw = torch.tensor(pos_weight, device="cuda")
+    pw_of = torch.tensor(dom_pw, dtype=torch.float32)[torch.from_numpy(domain)]  # per-frame pos_weight
 
     step, best, t0 = 0, -1.0, time.time()
     for epoch in range(args.epochs):
         run_loss, run_n = 0.0, 0
-        for x, y, t, _ in loader:
+        for x, y, t, gi in loader:
             xb = to_input(x, args.views, not args.no_aug)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = model(xb, t.cuda(non_blocking=True))
-            loss = F.binary_cross_entropy_with_logits(logits.float(), y.cuda(non_blocking=True), pos_weight=pw)
+            y = y.cuda(non_blocking=True)
+            w = torch.where(y > 0, pw_of[gi].cuda(non_blocking=True), torch.ones_like(y))
+            loss = (F.binary_cross_entropy_with_logits(logits.float(), y, reduction="none") * w).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
