@@ -193,6 +193,9 @@ class LiberoEnv(gym.Env):
         self.task_id_filter = cfg.get("task_id_filter", None)
         if self.task_id_filter is not None:
             self.task_id_filter = list(self.task_id_filter)
+        # Optional override dir for safety init states (default: shipped suite files)
+        self.init_states_root = cfg.get("init_states_root", None)
+        self._init_states_cache = {}
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
@@ -1053,6 +1056,24 @@ class LiberoEnv(gym.Env):
         task_id = int(task_id)
         if self.libero_type == "safety":
             task = self.task_suite.get_task(task_id)
+            if self.init_states_root:
+                # Fresh (non-shipped) init states, same layout as the suite:
+                # <root>/<problem_folder>/L<level>/<init_states_file>
+                path = os.path.join(
+                    self.init_states_root,
+                    task.problem_folder,
+                    f"L{task.level}",
+                    task.init_states_file,
+                )
+                if path not in self._init_states_cache:
+                    if not os.path.exists(path):
+                        # Tasks outside task_id_filter are only counted for the
+                        # reset-id layout, never run: shipped states are fine there.
+                        if self.task_id_filter is None or task_id in self.task_id_filter:
+                            raise FileNotFoundError(f"[init_states_root] missing {path}")
+                        return self.task_suite.get_task_init_states(task.level, task.level_id)
+                    self._init_states_cache[path] = torch.load(path, weights_only=False)
+                return self._init_states_cache[path]
             return self.task_suite.get_task_init_states(task.level, task.level_id)
         return self.task_suite.get_task_init_states(task_id)
 

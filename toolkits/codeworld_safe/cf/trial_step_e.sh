@@ -15,6 +15,9 @@ CAMS=${CAMS:-[agentview_image,robot0_eye_in_hand_image]}
 ROLLOUT_GPUS=${ROLLOUT_GPUS:-}
 PLACE_ARGS=()
 [ -n "$ROLLOUT_GPUS" ] && PLACE_ARGS=("++cluster.component_placement.rollout=$ROLLOUT_GPUS")
+# INIT_ROOT: load fresh (non-shipped) init states from this dir instead of the suite files.
+INIT_ROOT=${INIT_ROOT:-}
+[ -n "$INIT_ROOT" ] && PLACE_ARGS+=("++env.eval.init_states_root=$INIT_ROOT")
 if [ -n "$PROGRAM" ]; then BR=$MAX_BRANCHES; else BR=0; fi
 MAX_ROLLOUT_STEPS=$(((BR + 1) * EPISODE_STEPS))
 mkdir -p "$OUT"

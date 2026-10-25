@@ -208,6 +208,8 @@ def main() -> None:
     ap.add_argument("--max-branches", type=int, default=3)
     ap.add_argument("--cells", default="")
     ap.add_argument("--timeout-s", type=int, default=3 * 3600)
+    ap.add_argument("--init-states-root", type=Path, default=None,
+                    help="fresh init-state dir (calib_fresh/test_fresh); default = shipped suite states")
     a = ap.parse_args()
     root = a.root
     (root / "runs").mkdir(parents=True, exist_ok=True)
@@ -250,7 +252,8 @@ def main() -> None:
             out = root / "runs" / cell / run_id
             env = dict(os.environ, SUITE=suite, LEVEL=level, TASK=str(task), OUT=str(out), GPUS=a.gpus,
                        ROLLOUT_GPUS=a.rollout_gpus,
-                       ENVS=str(a.envs), SEED=str(1000 * rnd + idx), MAX_BRANCHES=str(a.max_branches))
+                       ENVS=str(a.envs), SEED=str(1000 * rnd + idx), MAX_BRANCHES=str(a.max_branches),
+                       INIT_ROOT=str(a.init_states_root or ""))
             if pid:
                 ppath = adir / "programs" / f"{pid}.json"
                 if not ppath.exists():
