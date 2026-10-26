@@ -69,6 +69,8 @@ class SafeWorldModelEnv:
         self.max_chunks = int(cfg.max_chunks)
         self.max_episode_steps = self.chunk * self.max_chunks
         self.success_threshold = float(cfg.success_threshold)
+        self.success_consecutive = int(cfg.get("success_consecutive", 1))
+        self.use_state_offset = bool(cfg.get("state_offset", True))
         self.top_m = int(cfg.cost_top_m)
         self.cost_budget = float(cfg.cost_budget)
         self.eta_lr = float(cfg.eta_lr)
@@ -187,6 +189,11 @@ class SafeWorldModelEnv:
         self.task_descriptions = [self.kf_inst[i] for i in kf]
         self.states = torch.from_numpy(self.kf_states[kf]).to(self.device)
         self.last_frame = torch.from_numpy(memory[:, -1]).to(self.device)  # [B, 512, 256, 3] uint8
+        # per-scene regressor bias: real keyframe state minus the reading of the same frame
+        if self.use_state_offset:
+            self.state_offset = self.states - self.state_reader(self.last_frame)
+        else:
+            self.state_offset = torch.zeros_like(self.states)
         self.step_costs = torch.zeros(self.num_envs, self.max_episode_steps, device=self.device)
         self.ended = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.success_once = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -241,7 +248,11 @@ class SafeWorldModelEnv:
         agent = ft[:, :, :256].reshape(-1, 256, 256, 3).permute(0, 3, 1, 2).float().div(127.5).sub(1)
         inst = [s for s in self.task_descriptions for _ in range(self.chunk)]
         p_succ = self.reward_model.predict_rew(agent, inst).view(self.num_envs, self.chunk)
-        success = p_succ.max(1).values >= self.success_threshold
+        self.last_p_succ = p_succ
+        hit = p_succ >= self.success_threshold
+        for k in range(1, self.success_consecutive):  # k consecutive frames over the threshold
+            hit = hit[:, 1:] & hit[:, :-1]
+        success = hit.any(1)
 
         # cost: SAM on the generated latent, continuous probability, task-applicable channels
         logits = self.sam(z.to(self.device), torch.from_numpy(a).to(self.device), self.task_ids).float()
@@ -254,7 +265,7 @@ class SafeWorldModelEnv:
 
         # state: read from the last generated frame
         self.last_frame = ft[:, -1]
-        self.states = self.state_reader(self.last_frame)
+        self.states = self.state_reader(self.last_frame) + self.state_offset
         self._elapsed_steps = self._elapsed_steps + self.chunk
 
         trunc_now = live & ~success & (self._elapsed_steps >= self.max_episode_steps)
