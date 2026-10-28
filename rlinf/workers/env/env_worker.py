@@ -1682,6 +1682,7 @@ class EnvWorker(Worker):
             "loss_mask_sum": rollout_batch.get("loss_mask_sum", None),
             "normalize_advantages": self.cfg.algorithm.get("normalize_advantages", True)
             and not self.use_training_pipeline,
+            "adv_std_floor": self.cfg.algorithm.get("adv_std_floor", 0.0),
         }
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
         rollout_batch.update(advantages_and_returns)

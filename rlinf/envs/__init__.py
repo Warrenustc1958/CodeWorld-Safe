@@ -150,6 +150,10 @@ def get_env_cls(env_type: str, env_cfg=None):
 
         return RealWorldEnv
     elif env_type == SupportedEnvType.WORLD_MODEL:
+        if env_cfg is not None and env_cfg.get("sync_real", False):
+            from rlinf.envs.sim.world_model.safe.sync_real_env import SyncRealWorldModelEnv
+
+            return SyncRealWorldModelEnv
         if env_cfg is not None and env_cfg.get("safe", False):
             from rlinf.envs.sim.world_model.safe.safe_env import SafeWorldModelEnv
 

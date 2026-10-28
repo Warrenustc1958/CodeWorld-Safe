@@ -114,7 +114,12 @@ def compute_grpo_advantages(
     )
 
     advantages = grouped_rewards - grouped_reward_mean
-    advantages = advantages / (grouped_reward_std + 1e-6)
+    # adv_std_floor > 0 keeps near-constant groups (std ~1e-5) from being blown up to unit scale
+    std_floor = float(kwargs.get("adv_std_floor") or 0.0)
+    if std_floor > 0:
+        advantages = advantages / grouped_reward_std.clamp(min=std_floor)
+    else:
+        advantages = advantages / (grouped_reward_std + 1e-6)
 
     advantages = (torch.zeros_like(loss_mask) + advantages.view(1, -1)) * loss_mask
 

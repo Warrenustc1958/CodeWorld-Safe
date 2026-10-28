@@ -307,6 +307,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
             "advantage_mode": self.cfg.algorithm.get("advantage_mode", None),
+            "adv_std_floor": self.cfg.algorithm.get("adv_std_floor", 0.0),
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)

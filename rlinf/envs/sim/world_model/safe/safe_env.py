@@ -75,6 +75,12 @@ class SafeWorldModelEnv:
         self.cost_budget = float(cfg.cost_budget)
         self.eta_lr = float(cfg.eta_lr)
         self.eta = float(cfg.get("eta_init", 0.0))
+        self.eta_max = float(cfg.get("eta_max", float("inf")))
+        # gripper-release penalty: a closed->open switch not followed by success within
+        # release_window steps costs release_coef (count capped at release_cap); 0 disables
+        self.release_coef = float(cfg.get("release_coef", 0.0))
+        self.release_window = int(cfg.get("release_window", 16))
+        self.release_cap = int(cfg.get("release_cap", 3))
         self.pose_scale, self.pose_clip = float(cfg.pose_scale), float(cfg.pose_clip)
         self.main_size, self.wrist_size = int(cfg.main_image_size), int(cfg.wrist_image_size)
         self.video_cfg = cfg.get("video_cfg", None)
@@ -161,7 +167,7 @@ class SafeWorldModelEnv:
         """Called once per rollout (finish_rollout): Lagrange multiplier update."""
         if self._finished_costs:
             mean_c = float(np.mean(self._finished_costs))
-            self.eta = max(0.0, self.eta + self.eta_lr * (mean_c - self.cost_budget))
+            self.eta = min(self.eta_max, max(0.0, self.eta + self.eta_lr * (mean_c - self.cost_budget)))
             self._last_mean_cost = mean_c
             self._finished_costs = []
 
@@ -200,6 +206,9 @@ class SafeWorldModelEnv:
         self.returns = torch.zeros(self.num_envs, device=self.device)
         self.ep_cost = torch.zeros(self.num_envs, device=self.device)
         self.cost_by_depth = torch.zeros(self.num_envs, self.max_chunks, device=self.device)
+        self.prev_closed = self.mem_actions[:, -1, 6] > 0                 # [B] gripper state before t0
+        self.release_steps = [[] for _ in range(self.num_envs)]
+        self.n_release_pen = torch.zeros(self.num_envs, device=self.device)
         self._elapsed_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._is_start = False
         return self._wrap_obs(), {}
@@ -260,6 +269,13 @@ class SafeWorldModelEnv:
         step_cost = prob.max(-1).values                                    # [B, 8]
         live = ~self.ended
         s0 = depth * self.chunk
+        closed = a[..., 6] > 0                                              # [B, 8]
+        prev = np.concatenate([self.prev_closed[:, None], closed[:, :-1]], 1)
+        live_np = live.cpu().numpy()
+        for i, k in zip(*np.nonzero(prev & ~closed)):
+            if live_np[i]:
+                self.release_steps[i].append(s0 + int(k))
+        self.prev_closed = closed[:, -1]
         self.step_costs[live, s0:s0 + self.chunk] = step_cost[live]
         self.cost_by_depth[live, depth] = step_cost[live].mean(1)
 
@@ -276,6 +292,14 @@ class SafeWorldModelEnv:
         C = self.step_costs[:, : s0 + self.chunk].topk(m, dim=1).values.mean(1)
         rewards = torch.zeros(self.num_envs, self.chunk, device=self.device)
         rewards[end_now, -1] = succ_now[end_now].float() - self.eta * C[end_now]
+        if self.release_coef > 0:
+            t_end = s0 + self.chunk  # success step approximated by the end of the ending chunk
+            for i in torch.nonzero(end_now).flatten().tolist():
+                ok = bool(succ_now[i])
+                n = sum(1 for t in self.release_steps[i] if not (ok and t_end - t <= self.release_window))
+                n = min(n, self.release_cap)
+                self.n_release_pen[i] = n
+                rewards[i, -1] -= self.release_coef * n
         self.ep_cost = torch.where(end_now, C, self.ep_cost)
         self.success_once |= succ_now
         self.returns += rewards.sum(1)
@@ -289,6 +313,7 @@ class SafeWorldModelEnv:
         info = {"episode": {"success_once": self.success_once.clone(), "return": self.returns.clone(),
                             "episode_len": n_steps, "reward": self.returns / n_steps,
                             "cost": self.ep_cost.clone(), "eta": torch.full_like(self.returns, self.eta),
+                            "release_pen": self.n_release_pen.clone(),
                             **{f"cost_d{d + 1}": self.cost_by_depth[:, d].clone() for d in range(self.max_chunks)}}}
         return [self._wrap_obs()], rewards, terminations, truncations, [info]
 
