@@ -19,7 +19,8 @@ sent to Wan is also executed in that simulator. With ``reward_source: real`` the
 comes from the real simulator (check_success, official constraint violation), not from the reward
 model: used for the R1 causal test and to label Wan frames for reward-model training. RM and SAM are
 still computed and logged (``rm_success_once``) so the two can be compared.
-Episodes end at the first real success, at an official violation, or after ``max_chunks`` chunks.
+Reward, success termination, and violation termination are independently configurable.
+The default settings preserve the original real/RM episode behavior.
 """
 
 from __future__ import annotations
@@ -54,11 +55,25 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
     def __init__(self, cfg, *args, **kwargs):
         super().__init__(cfg, *args, **kwargs)
         self.reward_source = str(cfg.get("reward_source", "real"))  # real | rm
+        self.termination_source = str(cfg.get("termination_source", self.reward_source))  # real | rm | horizon
         self.end_on_violation = bool(cfg.get("end_on_violation", True))
-        # data collection only: keep stepping this many chunks after the first real success and
-        # record the per-step real goal state (frames can then be labelled by the actual state);
-        # the success time and the outcome are unchanged. 0 = end at the first success (training).
+        self.terminate_on_real_violation = bool(
+            cfg.get("terminate_on_real_violation", self.reward_source == "real")
+        )
+        if self.reward_source not in ("real", "rm"):
+            raise ValueError(f"Unknown reward_source: {self.reward_source}")
+        if self.termination_source not in ("real", "rm", "horizon"):
+            raise ValueError(f"Unknown termination_source: {self.termination_source}")
+        # Continue physics after success so fixed-horizon runs retain paired labels.
+        # Zero preserves the original early-stop behavior.
         self.tail_chunks = int(cfg.get("success_tail_chunks", 0))
+        if self.termination_source == "horizon" and (
+            self.end_on_violation or self.tail_chunks < self.max_chunks
+        ):
+            raise ValueError(
+                "horizon termination requires end_on_violation=false and "
+                "success_tail_chunks >= max_chunks"
+            )
         # diagnostics only: per real step, record goal / wrong-grasp-part (aux) / official violation
         self.record_steps = bool(cfg.get("record_steps", False))
         if self.release_coef > 0:
@@ -130,7 +145,10 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         return snap
 
     def _restore(self, slot, index):
-        from rlinf.envs.sim.libero.venv import _restore_simulator_state, _unwrap_task_env
+        from rlinf.envs.sim.libero.venv import (
+            _restore_simulator_state,
+            _unwrap_task_env,
+        )
 
         rec = self._records[self._kf_uid[index]]
         key = (rec["suite"], int(rec["task"]))
@@ -202,14 +220,20 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
             was_succ = bool(self.real_succ[i])
             for k in range(self.chunk):
                 env.step(a[i, k])
+                preds = audit_predicate_instances(env)
+                official_viol = any(
+                    p["source"] == "constraint" and p["value"] for p in preds
+                )
+                is_goal = bool(env.check_success())
+                new_violation = official_viol and not self.real_viol[i]
+                self.real_viol[i] |= official_viol
                 if self.record_steps:
-                    preds = audit_predicate_instances(env)
                     self.step_rec[i, s0 + k] = (
-                        bool(env.check_success()),
+                        is_goal,
                         any(p["source"] == "aux_constraint" and p["predicate"] == "wronggrasppart" and p["value"]
                             for p in preds),
-                        any(p["source"] == "constraint" and p["value"] for p in preds))
-                if env.check_success():
+                        official_viol)
+                if is_goal:
                     goal[i, k] = True
                     if not self.real_succ[i]:
                         self.real_succ[i], self.real_succ_step[i] = True, s0 + k
@@ -217,11 +241,11 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
                         if self.tail_chunks == 0:
                             break
                     continue
-                if (not self.real_succ[i] and self.end_on_violation
-                        and any(p["source"] == "constraint" and p["value"] for p in audit_predicate_instances(env))):
+                if not self.real_succ[i] and new_violation:
                     viol_now[i] = True
-                    self.real_viol[i], self.real_done[i] = True, True
-                    break
+                    if self.end_on_violation:
+                        self.real_done[i] = True
+                        break
             if self.real_succ[i]:
                 if was_succ:
                     self.tail_left[i] -= 1
@@ -239,24 +263,39 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         self.states = self.state_reader(self.last_frame) + self.state_offset
         self._elapsed_steps = self._elapsed_steps + self.chunk
 
-        if self.reward_source == "rm":
-            success = rm_success
-            failure = torch.zeros_like(rm_success)
+        if self.tail_chunks:  # a tail cut by the horizon still counts as success
+            succ_end |= live_np & self.real_succ & (
+                self._elapsed_steps.cpu().numpy() >= self.max_episode_steps
+            )
+        if self.termination_source == "real":
+            terminate_success = torch.from_numpy(succ_end).to(self.device)
+        elif self.termination_source == "rm":
+            terminate_success = rm_success
         else:
-            if self.tail_chunks:  # a tail cut by the horizon still counts as success
-                succ_end |= live_np & self.real_succ & (self._elapsed_steps.cpu().numpy() >= self.max_episode_steps)
-            success = torch.from_numpy(succ_end).to(self.device)
-            failure = torch.from_numpy(viol_now).to(self.device)
-        succ_now = live & success
-        fail_now = live & failure & ~success
-        trunc_now = live & ~success & ~failure & (self._elapsed_steps >= self.max_episode_steps)
+            terminate_success = torch.zeros_like(rm_success)
+        terminate_failure = (
+            torch.from_numpy(viol_now).to(self.device)
+            if self.terminate_on_real_violation
+            else torch.zeros_like(rm_success)
+        )
+        succ_now = live & terminate_success
+        fail_now = live & terminate_failure & ~terminate_success
+        trunc_now = live & ~succ_now & ~fail_now & (
+            self._elapsed_steps >= self.max_episode_steps
+        )
         end_now = succ_now | fail_now | trunc_now
+        reward_success = (
+            torch.from_numpy(self.real_succ.copy()).to(self.device)
+            if self.reward_source == "real"
+            else self.rm_success_once
+        )
+        outcome_success = end_now & reward_success & ~fail_now
         m = min(self.top_m, s0 + self.chunk)
         C = self.step_costs[:, : s0 + self.chunk].topk(m, dim=1).values.mean(1)
         rewards = torch.zeros(self.num_envs, self.chunk, device=self.device)
-        rewards[end_now, -1] = succ_now[end_now].float() - self.eta * C[end_now]
+        rewards[end_now, -1] = outcome_success[end_now].float() - self.eta * C[end_now]
         self.ep_cost = torch.where(end_now, C, self.ep_cost)
-        self.success_once |= succ_now
+        self.success_once |= outcome_success
         self.returns += rewards.sum(1)
         self.ended |= end_now
         self._finished_costs.extend(C[end_now].tolist())

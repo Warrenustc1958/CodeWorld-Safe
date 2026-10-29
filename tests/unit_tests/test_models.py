@@ -875,3 +875,21 @@ def test_delay_metrics_report_every_sample():
 
     assert metrics.tolist() == pytest.approx([0.03, 0.03])
     assert env.insert_delay_metrics().numel() == 0
+
+def test_openpi_rlinf_expert_only_keeps_frozen_vision_in_eval_mode():
+    from rlinf.models.embodiment.openpi_rlinf.pi0 import Pi0
+
+    model = Pi0.__new__(Pi0)
+    torch.nn.Module.__init__(model)
+    model.img = torch.nn.Dropout(p=0.5)
+    model.action_head = torch.nn.Dropout(p=0.5)
+    model.rl_cfg = SimpleNamespace(train_expert_only=True)
+
+    model.train()
+    assert model.training and model.action_head.training
+    assert not model.img.training
+
+    model.rl_cfg.train_expert_only = False
+    model.train()
+    assert model.img.training and model.action_head.training
+

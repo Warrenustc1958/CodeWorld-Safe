@@ -95,11 +95,23 @@ class SafeWorldModelEnv:
         self.kf_task = meta["task_id"].astype(np.int64)
         self.kf_inst = [str(s) for s in meta["instruction"]]
         self.kf_tcell = [str(s) for s in meta["tcell"]]
+        keep = np.ones(len(self.kf_task), dtype=bool)
         if cfg.get("keyframe_suites", None):
-            keep = np.isin(meta["suite"], list(cfg.keyframe_suites))
-            self.kf_pool = np.flatnonzero(keep)
-        else:
-            self.kf_pool = np.arange(len(self.kf_task))
+            keep &= np.isin(meta["suite"], list(cfg.keyframe_suites))
+        if cfg.get("keyframe_roles", None):
+            keep &= np.isin(meta["role"], list(cfg.keyframe_roles))
+        self.kf_pool = np.flatnonzero(keep)
+        if not len(self.kf_pool):
+            raise ValueError("No keyframes match the selected suites and roles")
+        self.keyframe_sampling = str(cfg.get("keyframe_sampling", "uniform"))
+        if self.keyframe_sampling == "balanced_tcell":
+            cells = np.asarray(self.kf_tcell)
+            self.kf_cell_pools = [
+                self.kf_pool[cells[self.kf_pool] == cell]
+                for cell in sorted(set(cells[self.kf_pool]))
+            ]
+        elif self.keyframe_sampling != "uniform":
+            raise ValueError(f"Unknown keyframe_sampling: {self.keyframe_sampling}")
         cmask = json.load(open(cfg.channel_mask))
         self.kf_chmask = np.array([cmask[t] for t in self.kf_tcell], bool)
 
@@ -172,8 +184,24 @@ class SafeWorldModelEnv:
             self._finished_costs = []
 
     def _sample_keyframes(self):
-        g = torch.randint(0, len(self.kf_pool), (self.num_group,), generator=self._generator).numpy()
-        return np.repeat(self.kf_pool[g], self.group_size)
+        if self.keyframe_sampling == "uniform":
+            g = torch.randint(
+                0, len(self.kf_pool), (self.num_group,), generator=self._generator
+            ).numpy()
+            selected = self.kf_pool[g]
+        else:
+            cells = torch.randint(
+                0, len(self.kf_cell_pools), (self.num_group,),
+                generator=self._generator,
+            ).tolist()
+            selected = np.empty(self.num_group, dtype=np.int64)
+            for i, cell in enumerate(cells):
+                pool = self.kf_cell_pools[cell]
+                index = torch.randint(
+                    0, len(pool), (1,), generator=self._generator
+                ).item()
+                selected[i] = pool[index]
+        return np.repeat(selected, self.group_size)
 
     @torch.no_grad()
     def reset(self, *, seed=None, options=None, episode_indices=None, env_idx=None):

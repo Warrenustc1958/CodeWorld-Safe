@@ -168,6 +168,17 @@ class Pi0(model.BaseModel):
         # use TF32. OpenPI RL keeps this even though it un-compiles sample_actions.
         torch.set_float32_matmul_precision("high")
 
+    def train(self, mode: bool = True):
+        """Keep the frozen vision encoder in eval mode during expert-only RL."""
+        super().train(mode)
+        if (
+            mode
+            and getattr(self, "rl_cfg", None) is not None
+            and self.rl_cfg.train_expert_only
+        ):
+            self.img.eval()
+        return self
+
     def _init_weights(self):
         """Initialize projection weights."""
         nn.init.normal_(self.action_in_proj.weight, std=0.02)
