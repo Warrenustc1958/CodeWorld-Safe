@@ -1,27 +1,117 @@
-# SC-GRPO 真实环境退化排查进展（截至 2026-10-29）
+# SC-GRPO 越训越差：根因排查、诊断实验结果与后续实验规划
 
-## 问题
+更新时间：2026-10-30 02:20（加入 E1 全 suite 配对实验和 E4 基线检查）。本文用于新会话快速了解项目现状、瓶颈和待办。所有数字都来自 gpu006 上的实际结果文件。没跑完的部分会单独标注。
 
-SC-GRPO 在冻结的 Wan 世界模型里训练，真实 LIBERO-Safety 评测反而变差。主线跑到约 303 步，在 280 步时 affordance SR 只有 0.40。
-a/b/c 三组消融（adv std floor、eta 上限、释放惩罚）训到 40 步都没有止住退化：
+---
 
-| 消融 | 总体 SR（base → 40 步） |
+## 0. 一页结论
+
+- **现象。** SC-GRPO 在冻结的 Wan 世界模型里训练 π0.5。真实 LIBERO-Safety 官方评测（60 cell × 20）的总体 SR 越训越低：base .703 → step 80 .623 → step 160 .543 → step 200 .529。affordance 在 step 280 只有 .40。
+- **主因：RM v3 给出的成功奖励不可靠。**
+  - 训练早期，信号弱而且有偏。约 90% 的误报是抓错部位，0.8×4 规则的召回只有 .67~.75，只有约 20% 的组内真实奖励有方差。
+  - 训练后期，RM 被策略钻空子。冻结评测 v4 上，RM precision 从 base 的 .82~.90 掉到 step 40 的 .40~.57。
+  - 因果实验：affordance 上用真实仿真器的目标判定作奖励（R1），训 10 步 SR .53 → .68，unsafe .33 → .10。同样训 10 步，用 RM 奖励（R0b8）只到 .56，unsafe .28。
+  - **E1 全 suite 配对实验（已确认主因）。** 四个 suite 一起训练，配置完全相同，只换奖励来源。step 10 的 affordance SR：真实奖励（R1-all）.530 → .600，RM 奖励（RM-all）.530 → .467，相差 .133（约 3 个标准误）；RM-all 的 unsafe 还从 .333 升到 .373。human_safety 两组都基本持平。
+  - **剩余混淆。** RM-all 用 RM 判成功来结束回合，R1-all 用真实判定，两者的差距里还混有"RM 提前结束回合"的影响。E2 用来拆开（RM 奖励 + 真实判定结束回合）。
+- **已排除或降级的因素：**
+  - adv 归一化爆炸、eta 无界增长、释放夹爪奖励：消融 a/b/c 修了这些，仍然退化。
+  - GRPO 掩码、打分和分组代码：检查后是正确的。
+  - SigLIP 的 train/eval 不一致：确认是 bug，但幅度不超出 clip 范围，属于次要因素。已在 `pi0.py` 修复（commit 8d3179d1），E1/E2 都用修复后的代码。
+- **注意。** R1 和 R0b8 只在 affordance 上训练，它们在其他 suite 上的掉点只说明单 suite 训练会遗忘，不能用来评价 RM 或奖励来源。R1-all 四个 suite 一起训练后，其他 suite 没有出现遗忘。
+- **当前瓶颈：**
+  1. 需要一个在 affordance 上能区分抓对 / 抓错部位、且不容易被钻空子的成功奖励。E4 基线：现有 RM v3/v5 在 D2 留出集上 precision 只有 .76~.83，都没通过 .93 的标准；RM v6 正在训练。
+  2. 真实奖励下 human_safety 的夹爪开合次数也在上升（每回合 4.8 → 7.2 次），长程训练是否稳定要看 step 20 及之后。
+  3. gpu006 资源和评测稳定性：多个 Ray head 并存时有端口冲突，并发 EGL reset 会抢 NVIDIA 驱动锁，见第 6 节。
+
+---
+
+## 1. 项目背景与设置
+
+- **项目。** CodeWorld-Safe / WM Safety：在动作条件世界模型（Wan，AC-SFT 微调）里做带安全约束的 VLA 后训练（SC-GRPO）。
+- **策略。** π0.5（openpi_rlinf，3.35B），`train_expert_only=True`，SigLIP 和 Gemma 主干冻结，只训 action expert。
+- **训练环境。** 冻结的 Wan 4.1k 世界模型生成想象画面。RM v3 给成功判定；SAM 给代价，代价进入拉格朗日约束（eta 为对偶变量，budget 0.13）。
+- **算法。** RLinf（Ray + FSDP），flow_sde 采样 logprob。GRPO 组大小 G=8，优势为 `(s-mean)/(std+1e-6)`。`kl_beta` 没有效果，因为没有参考 logprob。训练时 noise_level 0.5，评测时 0.3。
+- **真实评测。** LIBERO-Safety 官方协议，共 4 个 suite：affordance、human_safety、obstacle_avoidance、obstacle_avoidance_human。
+  - 每个 suite 分 L0/L1/L2 三级，每级 5 个任务，合计 60 cell × 20 次。
+  - L0/L1 用 fresh_init，L2 用官方提供的初始状态（训练数据从未见过）。
+  - 回合在第一次违反约束时结束；只有达成目标且没有违规才算成功。
+- **affordance 的目标定义。** 目标谓词是 `checkgrippercontactpart`，必须抓到指定部件。`wronggrasppart` 是辅助约束。这正是 RM 最容易出错的地方。
+
+---
+
+## 2. 排查过程与证据（按时间顺序）
+
+### 2.1 主线运行的观察（10-27）
+
+主线 `scgrpo_pi05_wan41k_main` 在约 303 步时被 SIGTERM，磁盘上只剩 step 40 和 step 280 的 checkpoint。
+
+| step | 真实评测总体 SR |
 |---|---|
-| a | 0.703 → 0.662 |
-| b | 0.703 → 0.637 |
-| c（40 个 cell） | 0.750 → 0.680 |
+| base | .703 |
+| 20 | .713 |
+| 80 | .623 |
+| 120 | .597 |
+| 160 | .543 |
+| 200 | .529 |
+| 240 | .547 |
 
-三组的 affordance 都从 0.53 掉到约 0.42。
+1. **想象里什么都没学到。** TensorBoard 上，想象成功率在 300 步里一直平在 .40~.45，代价平在 .19~.22。eta 从 0.2 线性涨到 5.5，说明 budget 0.13 不可达。
+2. **优势是噪声。**
+   - 有的组分数方差只有 1e-5~2e-4（全成功时代价为 0，全失败时代价约 1），归一化后被放大成 ±2 的优势，约 5/16 的组是这种情况。
+   - 拷贝回放：同一条动作序列复制 8 份，代价的方差（.04~.06）不小于策略采样之间的方差（.03）。所以只靠代价得到的优势就是 Wan / SAM 的噪声。
+3. **真实环境里的失败全是超时。** 夹爪开合次数上升：affordance 每回合 1.7 → 5.8 次，human_safety 4.8 → 10.7 次。失败回合里的松开次数是原来的 2~5 倍。而想象画面里的开合次数一直是每回合约 0.67 次，RM 对开合几乎没有反应。
+4. **释放测试（17 个"先松开后成功"的回合）。** 强制张开夹爪后 RM 成功率仍有 .59，来回切换时为 .82（原始动作是 1.00）。说明想象环境会奖励"松手"。
+5. **抓错部位回放。** RM 在抓错部位的回合上成功率是 .17，在干净的成功回合上是 1.00。SAM 能标出 73% 的抓错，但误报率 23%。
 
-## 因果实验
+### 2.2 消融 a/b/c（10-27，各 80 步，用户要求在 40 步停）
 
-- R1：真实仿真器的目标判定作为奖励，eta=0，固定 64 步，只训 affordance，20 步。
-- R0b8：RM v3 作为奖励（规则 0.8×4），8 卡，共 10 步。
-- 两者都用 `SyncRealWorldModelEnv`（`rlinf/envs/sim/world_model/safe/sync_real_env.py`）。在 Wan 推演的同时，真实 LIBERO 只跑物理，用来给出真实奖励和标签。
+修改内容：`adv_std_floor`（advantages.py 和两个 worker）、`eta_max`、`release_coef/window/cap`（safe_env.py）。已提交在 CWS d49c6246。
 
-## 阶段一结果
+| 消融 | 总体 SR（base → step 40） | affordance |
+|---|---|---|
+| a | .703 → .662 | .53 → ~.42 |
+| b | .703 → .637 | .53 → ~.42 |
+| c（40 cell） | .750 → .680 | .53 → ~.42 |
 
-### D1：真实环境配对评测（官方协议，每 cell 20 次，只在 base 也有结果的 cell 上配对比较）
+结论：修优势归一化、eta 和释放惩罚都不能阻止退化。所以退化不主要来自优化器层面的数值问题。
+
+### 2.3 冻结评测 v4（10-27）
+
+在 38 个起点上，对比 base 和 step 40 在真实环境和 Wan 画面上的表现：
+- 真实 SR：base 15/38 → step 40 8/38。
+- RM precision：base .82~.90 → step 40 .40~.57，真实画面和 Wan 画面都一样掉。
+
+这是 RM 被钻空子的直接证据。另外发现 O00 和 O01 两种状态输入下的动作完全一样，怀疑策略没有用到状态输入（未深究）。
+
+### 2.4 logprob 门控检查（Codex，10-27）
+
+`diagnostics/rootcause_20261027_v1/gate_isolation/`
+- 原始 train 模式 vs eval（batch 16）：chunk 最大差 0.099，ratio .93~1.10。
+- batch 32 vs 16：最大差 0.06。
+- 修复 vision 模式后：差为 0。
+- 没有任何 ratio 落在 clip 范围之外。
+
+### 2.5 因果实验 R1 / R0b8（10-28）
+
+- **R1。** 真实仿真器的目标判定作奖励，eta=0，固定 64 步，只训 affordance，checkpoint 有 step 10 和 step 20。
+- **R0b8。** RM v3（0.8×4）作奖励，8 卡，128 env × 4 epoch，共 10 步，checkpoint 有 step 5 和 step 10。
+- **环境。** 两者都用 `SyncRealWorldModelEnv`（`rlinf/envs/sim/world_model/safe/sync_real_env.py`）。在 Wan 推演的同时，真实 LIBERO ControlEnv 只跑物理，渲染用 osmesa，用来给出真实奖励和标签。
+- **开关。** `reward_source`（real / rm）、`end_on_violation`、`success_tail_chunks`、`record_steps`。
+- **一个混淆因素。** 在 `reward_source=rm` 模式下，RM 判成功会提前结束回合，真实仿真器也随之停止步进（sync_real_env 约第 197 / 251 行）。所以 R1 和 R0b8 的区别不只是奖励来源，还有终止条件。阶段二的 E2 要把这两者拆开。
+
+### 2.6 RM v4 / v5（10-28）
+
+- v4：on-policy 采集了 1536 个回合，路径 `/data_cf/cws_rm/frames_pol_v4`，训练结果在 `runs/rm_v4_onpolicy`。
+- v5：带成功之后的尾段标签，路径 `frames_pol_v5`，规则扫描在 `runs/rm_v5_tail/rule_sweep`。
+- 旧采集器在成功时就截断回合，导致"连续 k 帧"规则永远触发不了。v5 修好了这个问题，oracle 检查 P=1。
+- RM v3 各 suite 在 0.8×4 下的表现：affordance 在 poltest 上 P .375 / R .50，在 polval 上 P .636；其他 suite 在 .93~1.0。
+- v3 和 v5 取 AND 规则，没有比单独用 v3 更好。
+
+---
+
+## 3. 阶段一诊断（D1 / D2 / D3，10-29）
+
+### D1：真实环境配对评测（只在 base 也有结果的 cell 上比较）
 
 | checkpoint | cell 数 | affordance SR | human_safety SR | obstacle SR | obstacle_human SR | 总体 SR | 总体 unsafe |
 |---|---|---|---|---|---|---|---|
@@ -30,26 +120,33 @@ a/b/c 三组消融（adv std floor、eta 上限、释放惩罚）训到 40 步�
 | R0b8 step 5 | 53 | .530→.600 | .930→.933 | .713→.687 | .775→.819 | .732→.752 | .200→.164 |
 | R0b8 step 10 | 54 | .530→.563 | .930→.950 | .713→.683 | .706→.761 | .721→.737 | .206→.193 |
 
-- affordance 上，真实奖励（R1）的提升明显大于 RM 奖励（R0b8）。R1 的 unsafe 从 .333 降到 .10，R0b8 step 10 只降到 .277。
-- R1 到 step 20 时，没参与训练的 suite 明显下降：human_safety −11 个点，obstacle −13 个点。同时夹爪开合次数大增：obstacle 每回合 5.4 → 9.9 次，obstacle_human 5.8 → 10.2 次。
-- 这部分下降与 RM 无关，是只在 affordance 上训练造成的跨任务遗忘。R0b8 只训了 10 步，还没表现出来。
+- affordance unsafe：R1 step 10 / step 20 从 .333 降到 .100 / .110；R0b8 step 5 / step 10 降到 .213 / .277。
+- R1 step 20 在没训练过的 suite 上掉点，夹爪开合次数约翻倍（obstacle 每回合 5.4 → 9.9 次）。
+- **解读（用户指出，已采纳）。** 只训 affordance 的模型在其他 suite 上掉点，说明的是单 suite 训练会遗忘，不能作为 RM 或奖励来源好坏的证据。上表其他 suite 的列只用来衡量遗忘。
 
-### D2：affordance 上的 on-policy rollout（固定 64 步窗口，48 个起点 × G=8，标签取真实仿真器）
+### D2：affordance 上的 on-policy rollout，RM 判定对比真实标签
 
-| 策略 | 回合数 | 真实目标率 | 抓错部位率 | 0.8×4 P / R | 0.2×2 P / R | 0.8×4 误报（抓错 / 无目标） | 0.8×4 组内 adv 符号一致率 | 有真实信号的组 | RM 与真实都有信号的组 |
+设置：
+- 48 个起点 × G=8；
+- 固定 64 步窗口，不因违规提前结束，成功后继续跑满；
+- 逐步记录真实标签：目标是否达成、是否抓错部位、是否违规。
+
+| 策略 | 回合数 | 真实目标率 | 抓错部位率 | 0.8×4 P / R | 0.2×2 P / R | 0.8×4 误报（抓错 / 无目标） | 组内 adv 符号一致率（0.8×4） | 有真实信号的组 | RM 与真实都有信号的组 |
 |---|---|---|---|---|---|---|---|---|---|
 | base | 384 | .302 | .276 | .767 / .681 | .745 / .957 | 22 / 2 | .44 | .23 | .04 |
 | R0b8 step 5 | 384 | .328 | .268 | .800 / .667 | .756 / .937 | 19 / 2 | .52 | .27 | .13 |
 | R0b8 step 10 | 256（8/12 batch） | .359 | .227 | .831 / .750 | .733 / .957 | 12 / 2 | .50 | .19 | .03 |
 
-- 前 10 步里 RM 的精度没有下降，precision 0.77 → 0.83。所以 R0b8 前 10 步的问题不是 RM 被钻空子，而是 RM 的信号本身就弱。
-  - 约 90% 的误报是抓错部位。0.8×4 规则的召回只有 0.67~0.75。
-  - 只有 19~27% 的组内真实奖励有方差，RM 与真实都有信号的组只有 3~13%。
-  - 两者都有信号时，优势符号也只有约一半一致。
-- 在冻结评测 v4 上，RM 精度从 base 的 .82~.90 掉到 40 步的 .40~.57。所以被钻空子发生在更长的训练里。
-- 注意：RM v3 在 affordance poltest 上的 precision 是 .375，D2 里约 .77~.83。两者分布不同：poltest 是按成功截断的旧数据，D2 是固定窗口的 on-policy 数据。不应直接比较。
+- 前 10 步里 RM 没有被钻空子，precision 反而略升。
+- 早期的问题是信号弱且有偏：
+  - 误报大多是抓错部位；
+  - 召回低；
+  - 大部分组根本没有学习信号；
+  - 两者都有信号时，方向也只有一半一致。
+- 被钻空子出现在更长的训练里（见 2.3，step 40 时 precision 已掉到 .40~.57）。
+- 不要把这里的 precision 和 poltest 的 .375 直接比：poltest 是按成功截断的旧数据，D2 是固定窗口的 on-policy 数据，分布不同。
 
-### D3：logprob 不一致 vs 正常更新幅度（`gate_isolation/recomputed_logprobs.pt` + TensorBoard）
+### D3：logprob 不一致 vs 正常更新幅度
 
 | 对比 | chunk log-ratio 最大值 | ratio 范围 | 伪 KL |
 |---|---|---|---|
@@ -57,45 +154,195 @@ a/b/c 三组消融（adv std floor、eta 上限、释放惩罚）训到 40 步�
 | eval batch 32 vs 16 | 0.060 | 0.94–1.05 | 2.3e-4 |
 | 修复 vision 模式后 | 0 | 1.00 | 0 |
 
-训练日志里的正常更新幅度：
+训练日志里的正常更新幅度：approx_kl 均值 R1 6.8e-4、R0b 2.7e-4、R0b8 6.0e-4；clip_fraction 约 1e-4。
 
-| 运行 | approx_kl 均值 | clip_fraction 均值 |
-|---|---|---|
-| R1 | 6.8e-4 | 1.5e-4 |
-| R0b | 2.7e-4 | 5e-5 |
-| R0b8 | 6.0e-4 | 6e-5 |
+- **代码 bug。** `freeze_vlm()`（`openpi_action_model.py:1404`）只在加载时调用一次 `paligemma.eval()`，而 `embodied_fsdp_actor_worker.py:587` 每个训练步都会调用 `self.model.train()`，把 SigLIP 切回 train 模式。至今所有训练都带着这个不一致。
+- **影响。** 不一致与正常更新同量级，是持续噪声，但不形成超出 clip 的长尾，属于次要因素。
+- **修复（尚未修改）。** 在 `model.train()` 之后重新调用 `freeze_vlm()`，或者对 paligemma 调 `.eval()`。
 
-- 代码 bug：`freeze_vlm()` 只在加载时调用一次 `paligemma.eval()`，而 `embodied_fsdp_actor_worker.py:587` 每个训练步都会调用 `self.model.train()`，把 SigLIP 切回 train 模式。所以至今所有训练都带着这个不一致。
-- 不一致的幅度和正常更新同量级，但没有超出 clip 范围的长尾。它是持续噪声，不足以单独解释退化，属于次要因素。修复：在 `model.train()` 之后重新把 paligemma 设成 eval（尚未修改）。
-
-## 当前结论
-
-1. affordance 的退化主要来自 RM 奖励。
-   - 训练早期：信号弱且有偏，主要是抓错部位也能得分，加上召回低。
-   - 训练后期：策略学会钻 RM 的空子（冻结评测 v4 上精度掉到 .40~.57）。
-   - 真实奖励（R1）可以稳定提升 affordance，unsafe 也大幅下降。
-2. 其他 suite 的下降来自只在单一 suite 上训练造成的遗忘，并伴随夹爪开合次数上升。换 RM 解决不了，需要多 suite 训练或 SFT replay。
-3. SigLIP 的 train/eval 不一致是次要因素，作为一行修复并入阶段二。
-4. adv 归一化、eta、释放惩罚这些修改（消融 a/b/c）不能阻止退化。
-
-## 未完成项
+### 阶段一未完成项
 
 - D1：R1 step 20 还差 3 个 cell，R0b8 step 5 / step 10 分别还差 7 / 6 个 cell。
 - D2：R0b8 step 10 还差 4 个 batch；R1 step 10 的 on-policy 数据未采。
-- 2026-10-29 12:40，gpu006 整机任务被外部 kill，所有 GPU 任务已停。数据完好，脚本都能跳过已完成部分续跑（`run_d1.sh`、`diag/run_d2.sh`）。
+- 这些都不影响上面的结论。续跑时脚本会跳过已完成部分（`run_d1.sh` 跳过 EXIT=0 的 cell，`diag/run_d2.sh` 跳过已有的 batch 文件）。
 
-## 下一步（待确认）
+---
 
-- 阶段二
-  - T1/T2/T3：拆开奖励来源和提前终止两个开关，分别验证。
-  - 修复 SigLIP 的 eval 模式。
-  - RM 加入抓错部位的负样本，affordance 的成功判定改为必须抓对部位。
-- 阶段三：多 suite 或 SFT replay，解决跨任务遗忘。
+## 3.5 阶段二 E1：全 suite 配对实验（10-29 ~ 10-30）
 
-## 脚本与数据
+设置：
+- R1-all（`libero_safety_scgrpo_causal_r1all.yaml`）：真实仿真器目标判定作奖励，四个 suite 一起训练，GPU 0~3，20 步，每 5 步存一次。
+- RM-all（`libero_safety_scgrpo_causal_rmall.yaml`）：与 R1-all 只差奖励来源，RM v3 0.8×4，`termination_source: rm`，`terminate_on_real_violation: True`（违规处理与 R1-all 相同）。
+- 两组都用 SigLIP 修复后的代码；eta=0；回合 64 步。
 
-- 在 gpu006 `/data_cf/cws_sam/v1/scgrpo/`：
-  - D1：`run_d1.sh`、`eval_real*.sh`、`diag/matched_summ.py`，结果在 `diag/d1_matched.txt`。
-  - D2：`diag/collect_d2.py`、`diag/run_d2.sh`、`diag/analyze_d2.py`，数据在 `diag/d2/<policy>/batch_*.pkl`，结果在 `diag/d2_summary.json`。
-  - D3：`diag/d3_logprob_tail.py`，结果在 `diag/d3_summary.json`。
-- 这些脚本的副本在仓库的 `toolkits/codeworld_safe/scgrpo/diag/`。
+**R1-all step 10 相对 base（60 cell 完整）**
+
+| suite | L0 SR | L1 SR | L2 SR | 合计 SR | 合计 unsafe | 开合次数/回合 |
+|---|---|---|---|---|---|---|
+| affordance | .690→.740 | .590→.720 | .310→.340 | .530→.600 | .333→.247 | 1.69→2.02 |
+| human_safety | .860→.900 | .990→.930 | .940→.930 | .930→.920 | .207→.173 | 4.81→7.22 |
+| obstacle_avoidance | .700→.740 | .720→.740 | .720→.710 | .713→.730 | .077→.090 | 5.44→5.34 |
+| obstacle_avoidance_human | .670→.700 | .650→.670 | .600→.570 | .640→.647 | .177→.170 | 6.13→5.54 |
+| 总体 | | | | .703→.724 | .198→.170 | |
+
+**RM-all step 10 对比 R1-all step 10（affordance 和 human_safety，其余 suite 评测中）**
+
+| suite | level | base SR | R1-all | RM-all | base unsafe | R1-all | RM-all |
+|---|---|---|---|---|---|---|---|
+| affordance | L0 | .690 | .740 | .560 | .290 | .160 | .380 |
+| affordance | L1 | .590 | .720 | .500 | .350 | .230 | .370 |
+| affordance | L2 | .310 | .340 | .340 | .360 | .350 | .370 |
+| affordance | 合计 | .530 | .600 | .467 | .333 | .247 | .373 |
+| human_safety | 合计 | .930 | .920 | .910 | .207 | .173 | .210 |
+
+解读：
+- 每个 level 100 个回合，单个数字标准误约 ±.045；suite 合计 300 个回合，标准误约 ±.03。
+- affordance 上 R1-all 和 RM-all 相差 .133，约 3 个标准误；RM-all 低于 base。全 suite 配对设置下"RM 奖励导致 affordance 退化"成立，10 步内就出现。
+- L2（训练数据未见过）两组都 +.03，基本不受影响。
+- human_safety 两组都持平，和 RM 在该 suite 精度高（.93~1.0）一致。
+- 训练曲线（R1-all，想象中的指标）：`real_success` 前后都在 .32~.47 波动，`rm_false_success` .03~.06，approx_kl 约 1e-3，没有明显上升，真实评测的提升在训练曲线上看不出来。
+
+**E4 基线：现有 RM 在 D2 留出集上的检查**（`frames_d2/d2test`：16 个 affordance 起点，336 回合，123 个真实成功，64 个抓错部位的失败）
+
+| RM | 规则 | precision | recall | 误报（其中抓错部位） |
+|---|---|---|---|---|
+| v3 | 0.5×3 | .774 | 1.000 | 36（31） |
+| v3 | 0.8×4（训练用） | .758 | .789 | 31（30） |
+| v5 | 0.8×4 | .825 | .650 | 17（16） |
+| v5 | 0.2×2 | .700 | .967 | 51（32） |
+
+结论：现有 RM 在 affordance 上都过不了"precision ≥ .93 且 recall ≥ .75"，约 85~95% 的误报是抓错部位。
+
+---
+
+## 4. 因素归因汇总
+
+| 假设 | 证据 | 判定 |
+|---|---|---|
+| RM 成功信号不可靠（抓错部位误报、召回低，后期被钻空子） | D2 误报约 90% 是抓错部位；v4 precision 降到 .40~.57；R1 明显优于 R0b8；**E1 全 suite 配对：affordance R1-all .600 vs RM-all .467** | **主因（已确认）** |
+| 优势归一化把噪声放大 | 约 5/16 组是退化组；但消融 a 修了仍然退化 | 次要，已修（adv_std_floor） |
+| 代价 / eta 不可达，导致拉格朗日权重爆炸 | eta 涨到 5.5；消融 b/c 修了仍然退化 | 次要 |
+| 想象环境奖励松手和夹爪来回开合 | 释放测试 RM 成功率 .59~.82 | 和 RM 问题同源，属于 RM 的漏洞 |
+| SigLIP train/eval 不一致 | 伪 KL ≈ approx_kl，没有超出 clip | 次要，已修（8d3179d1） |
+| Wan 生成画面的噪声 | 拷贝回放时 RM 成功判定在 2/32 组里翻转；代价噪声大 | 对代价影响大，对成功判定影响小 |
+| 单 suite 训练的遗忘 | R1 step 20 其他 suite 掉 11~13 个点；R1-all 四个 suite 一起训练后其他 suite 持平 | 实验设计带来的现象，不作为归因证据 |
+| 混淆：RM 提前终止导致真实仿真器停止步进 | sync_real_env 的代码逻辑 | 待 E2 拆开 |
+
+---
+
+## 5. 后续实验规划
+
+### 阶段二：修好奖励（目标：得到一个能替代真实奖励的 RM）
+
+前提：SigLIP 已修；保留 `adv_std_floor`；回合 64 步；eta=0（先不加约束）；四个 suite 一起训练。
+
+| 编号 | 内容 | 作用 | 通过标准 | 状态（10-30 02:20） |
+|---|---|---|---|---|
+| E1 | R1-all vs RM-all，只换奖励来源，20 步，评测 step 10/20 | 在全 suite 上归因到奖励来源 | RM-all 差距持续或扩大 → 主因确定 | step 10 已确认；step 20 和 RM-all 其余 suite 评测中（GPU 5/6/7） |
+| E2 | RM 奖励 + 真实判定结束回合（`libero_safety_scgrpo_causal_e2.yaml`），与 RM-all 只差终止条件，20 步 | 拆开"RM 提前结束回合"这个混淆 | 仍退化 → 问题在奖励本身；不退化 → 改成固定 64 步回合即可 | 训练中（GPU 0~3，02:10 起），预计 04:25 训完、06:10 评测完 |
+| E4 | RM v6：在 v5 配方上加入 D2 affordance 回合（Wan 帧 + 真实目标标签，抓错部位为负样本），32 个起点训练、16 个留出 | 修主因 | D2 留出集：affordance precision ≥ .93，recall ≥ .75，抓错部位误报减半 | 训练中（GPU 4，`runs/rm_v6_d2`），约 03:00 训完后做检查 |
+| E5（可选） | 大模型评判器，只在 RM 判成功时调用，否决抓错部位 | 不重训 RM 也能压误报 | 在 D2 上离线验证，标准同 E4 | 未开始；需要用户确认能否把帧发给外部服务 |
+| E6 | 用 RM v6 训全 suite（RMv6-all），其他同 RM-all，和 R1-all 配对，20 步 | 在线验证新奖励 | affordance 与 R1-all 差距 ≤ 3 个点，其他 suite 不退化 | E4 通过后 ~04:00 在 GPU 4~7 启动，预计 07:30 评测完 |
+| E7 | RMv6-all 训到 80 步，每 20 步做一次 D2 式 RM 精度检查和真实评测 | 检查长程训练下会不会再被钻空子 | RM 精度不随训练下降，真实 SR 不回落 | 待 E6 通过 |
+
+阶段二结束时要拿到：一个能替代真实奖励的 RM，以及它在 80 步内不被钻空子的证据。
+
+10-30 夜间（到 09:00 占用全部算力）的排程：
+
+| 时间 | GPU 0~3 | GPU 4 | GPU 5~7 |
+|---|---|---|---|
+| 02:00–03:20 | E2 训练 | E4：RM v6 训练 + D2 留出集检查 | E1 剩余评测（RM-all step 10/20、R1-all step 20） |
+| 03:20–04:25 | E2 训练 | 空闲 | 空闲，等 E4 结果 |
+| ~04:00–06:15 | E2 评测（GPU 0/1/2） | E6 训练（GPU 4~7） | E6 训练 |
+| 06:15–07:30 | E6 评测 | E6 评测 | E6 评测 |
+| 07:30–09:00 | 缓冲：补跑失败的 cell，汇总结果 | | |
+
+E4 不通过时不跑 E6，GPU 4~7 改去加跑 E1 的 step 40 或 E2 评测。
+
+### 阶段三：带安全约束重启主线
+
+1. **奖励。** 用 RM v6（或叠加 E5 的否决器），四个 suite 一起训练，回合固定 64 步。
+2. **把代价约束加回来，先解决代价噪声。** 之前拷贝回放显示 SAM 代价的噪声不小于策略间差异。
+   - 代价改成多次采样平均，或者只在组内代价方差明显时才计入优势；
+   - budget 设在可达的约 0.18，eta 加上限，使用全局 eta；
+   - 保留 `adv_std_floor`。
+3. **防遗忘和防夹爪来回开合。** 混入 SFT 回放数据（`enable_sft_co_train` 路径存在但未验证；`kl_beta` 当前不生效）。监控夹爪开合次数，必要时加开合惩罚。
+4. **监控和止损。** 每 20 步做 60 cell 真实评测和 D2 式 RM 精度检查；总体 SR 连续两次低于 base，或 RM 精度低于 .85，就停。
+
+### 大模型评判器的设计要点（E5）
+
+- **调用量。** 不建议当成每个 chunk 都调用的稠密奖励，单步训练就要判上千次。只在 RM 判成功的回合上调用，大约占 30~45% 的回合。
+- **输入。** 任务指令、正确部位的文字定义（取自 `checkgrippercontactpart` 指定的部件）、一张抓对和一张抓错的参考图、回合最后 2 个 chunk 的主视角加腕部视角关键帧。
+- **输出。**
+  
+  ```json
+  {"goal_achieved": true, "grasped_part": "handle", "part_correct": true,
+   "object_dropped": false, "confidence": 0.9, "evidence": "..."}
+  ```
+- **工程。** 固定模型版本，temperature 设为 0，按 (帧哈希, prompt) 缓存结果；做成异步批量请求；超时或失败时回退到只用 RM，并记录回退率。
+- **风险。**
+  - 细粒度的接触判断是通用 VLM 的弱项；
+  - 它看到的是 Wan 的想象画面，同样可能被钻空子；
+  - 渲染帧会发到外部服务，需要用户确认。
+
+---
+
+## 6. 关键路径与资源
+
+### 代码
+
+- **仓库。** github.com/Warrenustc1958/CodeWorld-Safe，main @ 8d3179d1（SigLIP 修复、sync env 终止开关、E1/E2 配置、`toolkits/codeworld_safe/scgrpo/e1/` 下的启动与评测脚本）。
+- **工作副本。** gpu006 上的 `/mnt/nfs/fjj/Code/CodeWorld-Safe`，branch 为 codeworld-safe。
+- **推送。** 运行 `/mnt/nfs/fjj/Code/cws_push.sh`，把 codeworld-safe 推到 main。
+- **主要文件：**
+  - 同步真实环境：`rlinf/envs/sim/world_model/safe/sync_real_env.py`；
+  - 安全环境（eta、释放惩罚）：`rlinf/envs/sim/world_model/safe/safe_env.py`；
+  - 优势计算（adv_std_floor）：`rlinf/algorithms/advantages.py`；
+  - 训练 worker（D3 bug，`model.train()` 在第 587 行）：`rlinf/workers/actor/embodied_fsdp_actor_worker.py`；
+  - 配置：`examples/embodiment/config/libero_safety_scgrpo_{ablate_a,b,c, causal_r1,r0,r0b,r0b8, causal_r1all,causal_rmall,causal_e2}.yaml`；
+  - 多链真实评测：`toolkits/codeworld_safe/scgrpo/e1/run_multi.sh`（每条链独立 Ray 端口 / worker 端口段 / 锁，每 cell 限时 20 分钟，自动重试一轮）；
+  - 诊断报告和脚本：`toolkits/codeworld_safe/scgrpo/DIAGNOSIS.md`、`toolkits/codeworld_safe/scgrpo/diag/`。
+
+### 数据（都在 gpu006 本地盘 `/data_cf`，不在 NFS 上）
+
+- **scgrpo 工作目录。** `/data_cf/cws_sam/v1/scgrpo/`
+  - checkpoint：
+    - R1：`causal/r1/scgrpo_causal_r1/checkpoints/global_step_{10,20}`；
+    - R0b8：`causal/r0b8/scgrpo_causal_r0b8/checkpoints/global_step_{5,10}`，每个 16 GB。
+  - 真实评测：`eval_real/<name>/`；汇总脚本 `summ_eval_real.py` 和 `diag/matched_summ.py`；D1 结果在 `diag/d1_matched.txt`。
+  - D2：数据在 `diag/d2/<policy>/batch_*.pkl`（每个约 40 MB，包含主视角和腕部视角 jpg、step_rec、rm_v3_p、actions），汇总在 `diag/d2_summary.json`。
+  - D3：`diag/d3_summary.json`。
+  - logprob 门控检查：`diagnostics/rootcause_20261027_v1/gate_isolation/`。
+- **RM 数据和模型。** `/data_cf/cws_rm/frames_pol_v4`、`frames_pol_v5`、`frames_d2`（d2train / d2test）；`runs/rm_v4_onpolicy`、`runs/rm_v5_tail/rule_sweep`、`runs/rm_v6_d2`；D2 检查结果 `runs/gate_d2.json`。
+- **E1/E2 checkpoint**（每个 15 GB，/data_cf 剩约 75 GB，所以 E2/E6 改为每 10 步存一次）：`causal/r1all/...`、`causal/rmall/...`（step 5/10/15/20），`causal/e2/...`（step 10/20）。
+- **ModelScope。** 上传脚本 `upload_causal_ms.py` 已写好，上传到 `causal_r1_rm_v5/`，还没运行。
+
+### 集群注意事项
+
+- ssh 必须加 `-o ClearAllForwardings=yes`。
+- 每个任务用自己的 Ray head：设置 `RAY_AUTH_MODE=disabled`，用独立的端口和 temp-dir，永远不要执行 `ray stop`。
+- 真实环境渲染用 `MUJOCO_GL=osmesa`。
+- 不要用 `pgrep/pkill -f` 匹配自己 ssh 命令里出现的字符串，会把自己的 shell 杀掉。
+- 两个训练不要放在同一组 GPU 上。
+- 自动权限分类器经常拦下 kill、push、rm 之类的命令。拦下时请用户用 `!` 自己执行。
+- **GPU 3/4 有 EGL 故障**（dmesg Xid 109 CTX SWITCH TIMEOUT 在 GPU 3），评测默认 EGL 渲染，不要放在 GPU 3/4；训练用 osmesa 不受影响。
+- **多个 Ray head 并存：** 每个 head 要指定互不重叠的 `--min/max-worker-port`、`--ray-client-server-port`，CPU 限到 32；worker 端口段不能包含 dashboard agent 默认端口 52365；端口 6461 属于 cowmpo。
+- **并发评测上限：** 每张卡只放 1 条评测链，链之间错开 90 秒启动；12 条链同时 reset 会让进程卡在 NVIDIA 驱动锁 `rmapiLockAcquire`（D 状态），reset 从 4 秒变成 460 秒。
+- **停 Ray head 时要按环境变量 `RAY_TMPDIR` 找残留进程**：Ray client server 的命令行不带 temp 目录，按命令行匹配会漏掉，残留进程占着 client 端口会让新 head 卡在 NodeProbe。
+- **gpu005。** 普通用户 zbuser05，没有 sudo；OSMesa 装在 `/mnt/nfs/fjj/local-osmesa`；内网 IP 10.20.10.51。
+  - 目前关机。
+  - 上面的 r0b8c（R0b8 续跑到 90 步）checkpoint 还没取回。
+  - 临时授权的 key 恢复开机后要删掉。
+
+---
+
+## 7. 待办清单
+
+1. **（进行中，10-30 夜间）** E1 剩余评测；E2 训练与评测；E4 RM v6 训练与 D2 留出集检查；E4 通过后启动 E6。
+2. **（E4 之后）** E6 结果出来后决定是否进入 E7（80 步长程）。
+3. **（可选）** E5 大模型评判器离线验证，需要用户确认能否把帧发给外部服务。
+4. **（阶段三准备）** 代价降噪方案（多次采样平均 / 组内方差门限）；验证 `enable_sft_co_train`。
+5. **（其他）**
+   - 运行 ModelScope 上传；
+   - gpu005 恢复后取回 r0b8c checkpoint 并删除临时 key；
+   - 磁盘：E1 的 step 5/15 checkpoint（4 个 × 15 GB）不评测，确认后可删。
