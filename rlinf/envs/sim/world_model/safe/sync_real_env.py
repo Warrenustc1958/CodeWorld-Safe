@@ -59,6 +59,8 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         # record the per-step real goal state (frames can then be labelled by the actual state);
         # the success time and the outcome are unchanged. 0 = end at the first success (training).
         self.tail_chunks = int(cfg.get("success_tail_chunks", 0))
+        # diagnostics only: per real step, record goal / wrong-grasp-part (aux) / official violation
+        self.record_steps = bool(cfg.get("record_steps", False))
         if self.release_coef > 0:
             raise ValueError("SyncRealWorldModelEnv does not implement the release penalty")
         self._records = {}
@@ -158,6 +160,7 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         self.real_done = self.real_succ.copy()
         self.real_succ_step = np.where(self.real_succ, 0, -1)
         self.tail_left = np.full(n, -1)  # chunks still to run after the first real success
+        self.step_rec = np.zeros((n, self.max_episode_steps, 3), bool)  # goal, wrong part, official violation
         self.rm_success_once = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.last_real_goal = np.zeros((n, self.chunk), bool)
         return obs, info
@@ -199,6 +202,13 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
             was_succ = bool(self.real_succ[i])
             for k in range(self.chunk):
                 env.step(a[i, k])
+                if self.record_steps:
+                    preds = audit_predicate_instances(env)
+                    self.step_rec[i, s0 + k] = (
+                        bool(env.check_success()),
+                        any(p["source"] == "aux_constraint" and p["predicate"] == "wronggrasppart" and p["value"]
+                            for p in preds),
+                        any(p["source"] == "constraint" and p["value"] for p in preds))
                 if env.check_success():
                     goal[i, k] = True
                     if not self.real_succ[i]:
