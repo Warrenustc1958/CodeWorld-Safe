@@ -20,7 +20,8 @@ comes from the real simulator (check_success, official constraint violation), no
 model: used for the R1 causal test and to label Wan frames for reward-model training. RM and SAM are
 still computed and logged (``rm_success_once``) so the two can be compared.
 Reward, success termination, and violation termination are independently configurable.
-The default settings preserve the original real/RM episode behavior.
+``outcome_order`` (legacy | step) and ``success_reward_rule`` (once | final) default to the
+original behavior.
 """
 
 from __future__ import annotations
@@ -74,6 +75,18 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
                 "horizon termination requires end_on_violation=false and "
                 "success_tail_chunks >= max_chunks"
             )
+        # outcome_order: legacy = original chunk-level rule (a success anywhere in the chunk beats a
+        # violation in the same chunk); step = decide by step order inside the chunk, a tie counts as
+        # the violation (official protocol: success = goal reached without a prior violation).
+        self.step_order = str(cfg.get("outcome_order", "legacy")) == "step"
+        if str(cfg.get("outcome_order", "legacy")) not in ("legacy", "step"):
+            raise ValueError(f"Unknown outcome_order: {cfg.get('outcome_order')}")
+        # success_reward_rule: once = success at any time in the episode (original); final = success
+        # still holds at the end of the episode (real: goal at the last executed step; rm: RM hit in
+        # the episode's final chunk), so a transient false RM hit is not paid at the horizon.
+        self.reward_rule = str(cfg.get("success_reward_rule", "once"))
+        if self.reward_rule not in ("once", "final"):
+            raise ValueError(f"Unknown success_reward_rule: {self.reward_rule}")
         # diagnostics only: per real step, record goal / wrong-grasp-part (aux) / official violation
         self.record_steps = bool(cfg.get("record_steps", False))
         if self.release_coef > 0:
@@ -181,6 +194,7 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         self.step_rec = np.zeros((n, self.max_episode_steps, 3), bool)  # goal, wrong part, official violation
         self.rm_success_once = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.last_real_goal = np.zeros((n, self.chunk), bool)
+        self.last_goal = self.real_succ.copy()  # goal predicate at the last executed real step
         return obs, info
 
     # ------------------------------------------------------------------ dynamics
@@ -209,11 +223,15 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         for _ in range(1, self.success_consecutive):
             hit = hit[:, 1:] & hit[:, :-1]
         rm_success = hit.any(1)
+        # in-chunk step at which the RM rule first fires (chunk = never)
+        rm_step = torch.where(rm_success, hit.float().argmax(1) + self.success_consecutive - 1,
+                              torch.full_like(rm_success, self.chunk, dtype=torch.long))
         self.rm_success_once |= live & rm_success
 
         # real simulator: same actions, stop at success / official violation
         goal = np.zeros((self.num_envs, self.chunk), bool)
         viol_now = np.zeros(self.num_envs, bool)
+        viol_step = np.full(self.num_envs, self.chunk)  # in-chunk step of the first new violation
         succ_end = np.zeros(self.num_envs, bool)  # outcome decided as success in this chunk
         for i in np.flatnonzero(live_np & ~self.real_done):
             env = self._real[i]
@@ -227,12 +245,20 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
                 is_goal = bool(env.check_success())
                 new_violation = official_viol and not self.real_viol[i]
                 self.real_viol[i] |= official_viol
+                self.last_goal[i] = is_goal
                 if self.record_steps:
                     self.step_rec[i, s0 + k] = (
                         is_goal,
                         any(p["source"] == "aux_constraint" and p["predicate"] == "wronggrasppart" and p["value"]
                             for p in preds),
                         official_viol)
+                if self.step_order and new_violation and not self.real_succ[i]:
+                    # a violating step cannot also be the success step
+                    viol_now[i], viol_step[i] = True, min(viol_step[i], k)
+                    if self.end_on_violation:
+                        self.real_done[i] = True
+                        break
+                    continue
                 if is_goal:
                     goal[i, k] = True
                     if not self.real_succ[i]:
@@ -241,8 +267,8 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
                         if self.tail_chunks == 0:
                             break
                     continue
-                if not self.real_succ[i] and new_violation:
-                    viol_now[i] = True
+                if not self.step_order and not self.real_succ[i] and new_violation:
+                    viol_now[i], viol_step[i] = True, min(viol_step[i], k)
                     if self.end_on_violation:
                         self.real_done[i] = True
                         break
@@ -278,17 +304,28 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
             if self.terminate_on_real_violation
             else torch.zeros_like(rm_success)
         )
+        if self.step_order and self.termination_source == "rm":
+            # RM success counts only if it fires strictly before the first violation of the chunk
+            rm_first = rm_step < torch.from_numpy(viol_step).to(self.device)
+            terminate_success = terminate_success & (rm_first | ~terminate_failure)
         succ_now = live & terminate_success
         fail_now = live & terminate_failure & ~terminate_success
         trunc_now = live & ~succ_now & ~fail_now & (
             self._elapsed_steps >= self.max_episode_steps
         )
         end_now = succ_now | fail_now | trunc_now
-        reward_success = (
-            torch.from_numpy(self.real_succ.copy()).to(self.device)
-            if self.reward_source == "real"
-            else self.rm_success_once
-        )
+        if self.reward_rule == "final":
+            reward_success = (
+                torch.from_numpy(self.last_goal.copy()).to(self.device)
+                if self.reward_source == "real"
+                else rm_success
+            )
+        else:
+            reward_success = (
+                torch.from_numpy(self.real_succ.copy()).to(self.device)
+                if self.reward_source == "real"
+                else self.rm_success_once
+            )
         outcome_success = end_now & reward_success & ~fail_now
         m = min(self.top_m, s0 + self.chunk)
         C = self.step_costs[:, : s0 + self.chunk].topk(m, dim=1).values.mean(1)
