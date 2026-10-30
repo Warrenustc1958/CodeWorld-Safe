@@ -1,0 +1,16 @@
+[Unit]
+Description=CodeWorld-Safe SC-GRPO night pipeline (E7 eval, RM R2/R3, E9) - /data_cf/cws_sam/v1/scgrpo/night_pipeline.sh
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data_cf/cws_sam/v1/scgrpo
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash /data_cf/cws_sam/v1/scgrpo/night_pipeline.sh
+Restart=on-failure
+RestartSec=20
+StartLimitIntervalSec=0
+KillMode=process
+StandardOutput=append:/data_cf/cws_sam/v1/scgrpo/causal/night/pipeline.log
+StandardError=append:/data_cf/cws_sam/v1/scgrpo/causal/night/pipeline.log

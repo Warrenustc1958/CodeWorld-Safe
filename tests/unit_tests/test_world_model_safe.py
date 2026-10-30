@@ -169,3 +169,20 @@ def test_real_reward_rule_goal_lost_before_horizon(monkeypatch, reward_rule, exp
     assert env._real[0].steps == 16
     assert t2[0, -1]
     assert r2[0, -1].item() == expected_reward
+
+
+@pytest.mark.parametrize(("views", "rows"), [(1, 256), (2, 512)])
+def test_reward_model_gets_agent_or_agent_plus_wrist(monkeypatch, views, rows):
+    seen = {}
+
+    def predict(frames, instructions):
+        seen["shape"] = tuple(frames.shape)
+        return torch.zeros(8)
+
+    env = _make_env(monkeypatch, reward_source="rm", termination_source="horizon",
+                    rm_probs=[torch.zeros(8)], real_env=_RealEnv(goal_at=None))
+    env.reward_model = SimpleNamespace(views=views, predict_rew=predict)
+
+    env.chunk_step(torch.zeros(1, 8, 7))
+
+    assert seen["shape"] == (8, 3, rows, 256)

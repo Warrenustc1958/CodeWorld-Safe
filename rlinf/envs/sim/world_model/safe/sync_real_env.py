@@ -215,7 +215,9 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         live_np = live.cpu().numpy()
 
         # reward model on the agent view (logged; used only with reward_source == "rm")
-        agent = ft[:, :, :256].reshape(-1, 256, 256, 3).permute(0, 3, 1, 2).float().div(127.5).sub(1)
+        # single-view RM: agent view (top 256 rows); dual-view RM: agent + wrist stacked (all 512 rows)
+        rows = 256 * int(getattr(self.reward_model, "views", 1))
+        agent = ft[:, :, :rows].reshape(-1, rows, 256, 3).permute(0, 3, 1, 2).float().div(127.5).sub(1)
         inst = [s for s in self.task_descriptions for _ in range(self.chunk)]
         p_succ = self.reward_model.predict_rew(agent, inst).view(self.num_envs, self.chunk)
         self.last_p_succ = p_succ
