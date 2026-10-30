@@ -383,7 +383,7 @@ E4 不通过时不跑 E6，GPU 4~7 改去加跑 E1 的 step 40 或 E2 评测。
   - D3：`diag/d3_summary.json`。
   - logprob 门控检查：`diagnostics/rootcause_20261027_v1/gate_isolation/`。
 - **RM 数据和模型。** `/data_cf/cws_rm/frames_pol_v4`、`frames_pol_v5`、`frames_d2`（d2train / d2test）；`runs/rm_v4_onpolicy`、`runs/rm_v5_tail/rule_sweep`、`runs/rm_v6_d2`；D2 检查结果 `runs/gate_d2.json`。
-- **E1/E2 checkpoint**（每个 15 GB，/data_cf 剩约 75 GB，所以 E2/E6 改为每 10 步存一次）：`causal/r1all/...`、`causal/rmall/...`（step 5/10/15/20），`causal/e2/...`（step 10/20）。
+- **现存 checkpoint**（每个 15 GB）：`causal/r1/...`（step 10/20）、`causal/r1all/...`（step 5/10/15/20）、`causal/e2/...`（step 10/20）、`causal/r0b8/...`（step 5/10）。RM-all、主线、消融的 checkpoint 已于 10-30 删除，只剩评测结果（`eval_real/`）。
 - **ModelScope。** 上传脚本 `upload_causal_ms.py` 已写好，上传到 `causal_r1_rm_v5/`，还没运行。
 
 ### 集群注意事项
@@ -414,4 +414,4 @@ E4 不通过时不跑 E6，GPU 4~7 改去加跑 E1 的 step 40 或 E2 评测。
 5. **（其他）**
    - 运行 ModelScope 上传；
    - gpu005 恢复后取回 r0b8c checkpoint 并删除临时 key；
-   - 磁盘：E1 的 step 5/15 checkpoint（4 个 × 15 GB）不评测，确认后可删。
+   - 磁盘：10-30 已删除效果差的 checkpoint（主线 step 40/280、消融 a/b/c step 40、smoke step 1、RM-all step 5/10/15/20/40），/data_cf 可用 195 GB。保留 R1 10/20、R1-all 5/10/15/20、E2 10/20、R0b8 5/10。
