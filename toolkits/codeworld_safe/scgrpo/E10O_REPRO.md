@@ -111,7 +111,104 @@ sed -e 's|/data_cf/cws/step_e/runs/|/your/data/cws_rollout/step_e/runs/|g' \
     /data_cf/cws_sam/v1/labels/episodes.jsonl > /your/data/labels/episodes.jsonl
 ```
 
-`labels/episodes.jsonl` 本身（187 MB 的 `labels/` 目录）【需确认】是否已上传 ModelScope；没有的话请原作者单独提供。
+`labels/episodes.jsonl`（187 MB 的 `labels/` 目录）不在上面的数据集里，直接从 gpu006 拷贝：`/data_cf/cws_sam/v1/labels/`（见第 2.3 节）。
+
+另外，`episodes.jsonl` 引用的 11,682 个审计 `.json` 中，Step E 的 10,479 个都有 `state/*.npz` 快照；早期 rollout 的 1,203 个没有快照。`keyframes_v1` 来自 Step E 回合，训练用到的是 Step E 的快照，早期的 `.json` 一并拷过去即可。
+
+### 2.2 存储预算【已核实，gpu006 实测】
+
+| 类别 | 内容 | 大小 |
+|---|---|---|
+| 代码 | LIBERO-Safety（其中仿真器资产 `assets/` 17 GB） | 18 GB |
+| | diffsynth-studio | 0.14 GB |
+| 环境 | `.venv-openpi-libero-safety` | 9.5 GB |
+| 策略 | π0.5 OpenPI_RLinf（转换后） | 13 GB |
+| | π0.5 JAX 原件（只在自己转换时需要） | 12 GB |
+| 世界模型 | Wan DiT ema-step-41000 | 9.4 GB |
+| | Wan2.2 VAE | 2.7 GB |
+| 训练起点 | `keyframes_v1` | 88 GB |
+| 仿真器快照 | 审计 `.json` 11,682 个 + `state/*.npz` 10,479 个 | 29.3 + 1.0 GB |
+| | `labels/` | 0.19 GB |
+| 评分模型 | SAM、通道掩码、状态读出、RM v3 | 0.11 GB |
+| 评测 | `fresh_init/v1`、base 评测结果 `off_base` | 0.62 GB |
+| **数据和模型小计** | | **约 175 GB**（自己转换 π0.5 再加 12 GB） |
+| E10-O 训练 | checkpoint：step 10/20/40/60/80 + 最新 1 个，每个 15 GB | 90 GB |
+| E10-O 评测 | 5 个 checkpoint 的评测结果 | 约 3 GB |
+| **合计** | | **约 270 GB** |
+
+另外：
+- **根分区要留空间**：Ray 的临时目录在 `/tmp`，根分区可用空间低于 5% 时 Ray 会报警，需要溢写对象时会失败。建议 `/tmp` 所在分区至少留 60 GB。
+- **数据盘**：checkpoint 写在配置的 `log_path` 下，建议和数据放在同一块本地 NVMe 盘上，不要放 NFS。
+
+### 2.3 从 gpu006 直接拷贝【已核实路径】
+
+最省事的做法是在新机器上**保持和 gpu006 完全相同的绝对路径**，这样配置文件和 `episodes.jsonl` 都不用改。做不到的话，按第 4 节和第 2.1 节修改路径。
+
+| 内容 | gpu006 路径 | 大小 |
+|---|---|---|
+| π0.5（已转换） | `/mnt/nfs/fjj/Code/rlinf-safety-runtime/checkpoints/pi05_libero_safety_rlinf/` | 13 GB |
+| π0.5 JAX 原件（可选） | `/mnt/nfs/fjj/Models/pi05_libero_safety/` | 12 GB |
+| Wan DiT | `/data_cf/wan_ac_sft/runs/s3_dual_b10/ema-step-41000.safetensors` | 9.4 GB |
+| Wan2.2 VAE | `/mnt/nfs/fjj/wan_ac_sft/ckpt/RLinf-Wan-LIBERO-Spatial/Wan2.2_VAE.pth` | 2.7 GB |
+| 关键帧 | `/data_cf/cws_sam/v1/scgrpo/keyframes_v1/` | 88 GB |
+| SAM | `/data_cf/cws_sam/v1/checkpoints/cost_all_d32/` | 16 MB |
+| 通道掩码 | `/data_cf/cws_sam/v1/scgrpo/channel_mask.json` | 4 KB |
+| 状态读出 | `/data_cf/cws_sam/v1/scgrpo/state_reg_v1/` | 9 MB |
+| RM v3 | `/data_cf/cws_rm/runs/rm_v3_agent_w41k/` | 87 MB |
+| 快照索引 | `/data_cf/cws_sam/v1/labels/` | 187 MB |
+| 快照文件 | `/data_cf/cws/step_e/runs/` 和 `/mnt/nfs/fjj/Code/rlinf-safety-runtime/rollouts/` 下被引用的部分（清单见下） | 30.3 GB |
+| 评测初始状态 | `/data_cf/cws/fresh_init/v1/` | 0.5 MB |
+| base 评测结果 | `/data_cf/cws_sam/v1/scgrpo/eval_real/off_base/` | 0.6 GB |
+| LIBERO-Safety（含资产） | `/mnt/nfs/fjj/Code/LIBERO-Safety/` | 18 GB |
+| diffsynth-studio | `/mnt/nfs/fjj/Code/related_works/diffsynth-studio/` | 0.14 GB |
+| 评测脚本和链 | `/data_cf/cws_sam/v1/scgrpo/{run_causal.sh,run_multi.sh,launch_train.sh,eval_real_p2*.sh}`、`diag/{matched_summ.py,level_summ.py}` | 很小 |
+
+在**新机器**上执行（需要能 ssh 到 gpu006；`D=/` 表示保持原路径，也可以换成别的根目录）：
+
+```bash
+G=gpu006-root      # ssh 主机名；gpu006 的 ~/.ssh/config 有 RemoteForward 时要加 -o ClearAllForwardings=yes
+D=/                # 目标根目录
+R="rsync -aP --mkpath -e 'ssh -o ClearAllForwardings=yes'"
+
+# 1) 模型、关键帧、评分模型、评测数据（整目录 / 单文件）
+for p in /mnt/nfs/fjj/Code/rlinf-safety-runtime/checkpoints/pi05_libero_safety_rlinf/ \
+         /data_cf/wan_ac_sft/runs/s3_dual_b10/ema-step-41000.safetensors \
+         /mnt/nfs/fjj/wan_ac_sft/ckpt/RLinf-Wan-LIBERO-Spatial/Wan2.2_VAE.pth \
+         /data_cf/cws_sam/v1/scgrpo/keyframes_v1/ \
+         /data_cf/cws_sam/v1/checkpoints/cost_all_d32/ \
+         /data_cf/cws_sam/v1/scgrpo/channel_mask.json \
+         /data_cf/cws_sam/v1/scgrpo/state_reg_v1/ \
+         /data_cf/cws_rm/runs/rm_v3_agent_w41k/ \
+         /data_cf/cws_sam/v1/labels/ \
+         /data_cf/cws/fresh_init/v1/ \
+         /data_cf/cws_sam/v1/scgrpo/eval_real/off_base/ \
+         /mnt/nfs/fjj/Code/LIBERO-Safety/ \
+         /mnt/nfs/fjj/Code/related_works/diffsynth-studio/; do
+  eval $R "$G:$p" "$D${p#/}"
+done
+
+# 2) 仿真器快照：只拷 episodes.jsonl 引用的审计 .json 和 state/*.npz（30.3 GB）
+ssh -o ClearAllForwardings=yes $G 'python3 - <<EOF
+import json, pathlib
+out = set()
+for l in open("/data_cf/cws_sam/v1/labels/episodes.jsonl"):
+    r = json.loads(l)
+    for k in ("json", "root_json"):
+        p = r.get(k)
+        if not p: continue
+        out.add(p)
+        st = (json.load(open(p)).get("sim_state_trajectory") or {}).get("path")
+        if st: out.add(str(pathlib.Path(p).parent / st))
+open("/tmp/cws_snap_files.txt", "w").write("".join(x.lstrip("/") + "\n" for x in sorted(out)))
+print(len(out), "files")
+EOF'
+scp -o ClearAllForwardings=yes $G:/tmp/cws_snap_files.txt .
+rsync -aP --files-from=cws_snap_files.txt -e 'ssh -o ClearAllForwardings=yes' $G:/ $D
+```
+
+拷完后做两项检查：
+- 快照文件数：`wc -l cws_snap_files.txt` 应约为 22,161（11,682 个 `.json` 加 10,479 个 `.npz`）；
+- 关键帧大文件：`keyframes_v1/` 里的 `anchor.npy`、`memory.npy` 是完整文件，gpu006 上没有切片，不需要合并。
 
 ---
 
@@ -142,7 +239,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh          # uv
 mkdir -p ~/cws && cd ~/cws
 git clone https://github.com/Warrenustc1958/CodeWorld-Safe.git
 git clone https://github.com/LIBERO-SAFETY/LIBERO-Safety.git
-git clone <diffsynth-studio 仓库> related_works/diffsynth-studio   # 【需确认】使用的仓库和 commit
+git clone https://github.com/RLinf/diffsynth-studio.git related_works/diffsynth-studio
+git -C related_works/diffsynth-studio checkout 2a2e05f        # gpu006 上使用的 commit，无本地修改【已核实】
 
 # 2) venv：openpi 模型 + LIBERO-Safety 环境，torch 2.6.0 / cu124，Python 3.11
 cd CodeWorld-Safe
@@ -208,7 +306,7 @@ python -m rlinf.utils.ckpt_convertor.openpi.convert --mode jax_to_openpi_rlinf \
 
 - 转换器要 jax 和 orbax（venv 里已有）。输出权重是 fp32，`config.json` 记 `"dtype": "bfloat16"`。
 - **norm_stats 必须放在 `assets/lerobot/norm_stats.json`**：配置里 `norm_stats_path: ${..model_path}/assets/lerobot/norm_stats.json`。转换器 README 的示例路径是 `physical-intelligence/behavior/`，不要照抄。
-- gpu006 上已转换好的 `config.json` 是：`action_dim 32, action_horizon 32, max_token_len 200, paligemma_variant gemma_2b, action_expert_variant gemma_300m, pi05 true, pcd false, dtype bfloat16`。`--action-horizon 32` 是按这个推的，当初实际用的命令【需确认】。转换后请对照这份 `config.json`，并核对 `model.safetensors` 的键与 gpu006 上的一致。训练时 `num_action_chunks: 8`，实际只执行前 8 个动作。
+- gpu006 上已转换好的 `config.json` 是：`action_dim 32, action_horizon 32, max_token_len 200, paligemma_variant gemma_2b, action_expert_variant gemma_300m, pi05 true, pcd false, dtype bfloat16`。`--action-horizon 32` 是按这个推的，当初实际用的命令没有记录。**建议直接从 gpu006 拷贝已转换好的目录** `/mnt/nfs/fjj/Code/rlinf-safety-runtime/checkpoints/pi05_libero_safety_rlinf/`（13 GB，第 2.3 节），这样能保证和所有已有实验完全同一份权重；自己转换时，转完对照这份 `config.json`，并核对 `model.safetensors` 的键与 gpu006 上的一致。训练时 `num_action_chunks: 8`，实际只执行前 8 个动作。
 
 ---
 
