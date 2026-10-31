@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import pathlib
 
 import numpy as np
@@ -87,6 +88,14 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         self.reward_rule = str(cfg.get("success_reward_rule", "once"))
         if self.reward_rule not in ("once", "final"):
             raise ValueError(f"Unknown success_reward_rule: {self.reward_rule}")
+        # cost_source: sam = top-M mean of SAM step costs (original); real = 0/1 event cost from the synchronised
+        # simulator: an official or auxiliary (wrong grasp part, extra human contact, ...) violation from the
+        # start up to and including the first real goal step. SAM is still computed and logged as cost_sam.
+        self.cost_source = str(cfg.get("cost_source", "sam"))
+        if self.cost_source not in ("sam", "real"):
+            raise ValueError(f"Unknown cost_source: {self.cost_source}")
+        if self.cost_source == "real" and os.environ.get("RLINF_LIBERO_SAFETY_AUX") != "1":
+            raise ValueError("cost_source=real needs RLINF_LIBERO_SAFETY_AUX=1 (auxiliary violations)")
         # diagnostics only: per real step, record goal / wrong-grasp-part (aux) / official violation
         self.record_steps = bool(cfg.get("record_steps", False))
         if self.release_coef > 0:
@@ -188,6 +197,8 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         self.real_succ = np.array([bool(e.check_success()) for e in self._real])
         self.real_success_at_reset = int(self.real_succ.sum())  # should be 0 for valid keyframes
         self.real_viol = np.zeros(n, bool)
+        self.c_off = np.zeros(n, bool)  # official violation up to and including the first goal step
+        self.c_aux = np.zeros(n, bool)  # auxiliary violation, same window
         self.real_done = self.real_succ.copy()
         self.real_succ_step = np.where(self.real_succ, 0, -1)
         self.tail_left = np.full(n, -1)  # chunks still to run after the first real success
@@ -247,6 +258,9 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
                 is_goal = bool(env.check_success())
                 new_violation = official_viol and not self.real_viol[i]
                 self.real_viol[i] |= official_viol
+                if not self.real_succ[i]:  # cost window: before the first goal, the goal step included
+                    self.c_off[i] |= official_viol
+                    self.c_aux[i] |= any(p["source"] == "aux_constraint" and p["value"] for p in preds)
                 self.last_goal[i] = is_goal
                 if self.record_steps:
                     self.step_rec[i, s0 + k] = (
@@ -331,6 +345,9 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         outcome_success = end_now & reward_success & ~fail_now
         m = min(self.top_m, s0 + self.chunk)
         C = self.step_costs[:, : s0 + self.chunk].topk(m, dim=1).values.mean(1)
+        C_sam = C
+        if self.cost_source == "real":
+            C = torch.from_numpy(self.c_off | self.c_aux).to(self.device).float()
         rewards = torch.zeros(self.num_envs, self.chunk, device=self.device)
         rewards[end_now, -1] = outcome_success[end_now].float() - self.eta * C[end_now]
         self.ep_cost = torch.where(end_now, C, self.ep_cost)
@@ -352,6 +369,9 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
             "real_success": torch.from_numpy(self.real_succ.copy()).to(dev).float(),
             "real_violation": torch.from_numpy(self.real_viol.copy()).to(dev).float(),
             "rm_success_once": self.rm_success_once.float(),
+            "cost_sam": C_sam.clone(),
+            "cost_official": torch.from_numpy(self.c_off.copy()).to(dev).float(),
+            "cost_aux": torch.from_numpy(self.c_aux.copy()).to(dev).float(),
             "rm_false_success": (self.rm_success_once & ~torch.from_numpy(self.real_succ.copy()).to(dev)).float(),
             **{f"cost_d{d + 1}": self.cost_by_depth[:, d].clone() for d in range(self.max_chunks)}}}
         return [self._wrap_obs()], rewards, terminations, truncations, [info]

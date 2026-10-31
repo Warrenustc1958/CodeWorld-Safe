@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart cws-e11.service if E11 is unfinished and the service is not running
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /data_cf/cws_sam/v1/scgrpo/cws-e11-watch.sh

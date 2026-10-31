@@ -1,0 +1,16 @@
+[Unit]
+Description=CodeWorld-Safe SC-GRPO E11-SC + E11-SAM (20 steps each, then eval 10/20) - /data_cf/cws_sam/v1/scgrpo/e11_pipeline.sh
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/data_cf/cws_sam/v1/scgrpo
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash /data_cf/cws_sam/v1/scgrpo/e11_pipeline.sh
+Restart=on-failure
+RestartSec=300
+KillMode=process
+StandardOutput=append:/data_cf/cws_sam/v1/scgrpo/causal/e11night/pipeline.log
+StandardError=append:/data_cf/cws_sam/v1/scgrpo/causal/e11night/pipeline.log

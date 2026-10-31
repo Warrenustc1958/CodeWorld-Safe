@@ -122,6 +122,10 @@ class SafeWorldModelEnv:
         self._is_offloaded = False
         self._elapsed_steps = torch.zeros(num_envs, dtype=torch.long)
         self._finished_costs: list[float] = []
+        # global_eta: the runner aggregates the costs of a whole rollout over all env workers, updates one
+        # eta and broadcasts it (set_eta); the per-instance update below is then disabled.
+        self.global_eta = bool(cfg.get("global_eta", False))
+        self._round_cost_sum, self._round_cost_n = 0.0, 0
         self.update_reset_state_ids()
 
         self._build_models()
@@ -179,9 +183,22 @@ class SafeWorldModelEnv:
         """Called once per rollout (finish_rollout): Lagrange multiplier update."""
         if self._finished_costs:
             mean_c = float(np.mean(self._finished_costs))
-            self.eta = min(self.eta_max, max(0.0, self.eta + self.eta_lr * (mean_c - self.cost_budget)))
+            if self.global_eta:
+                self._round_cost_sum += float(np.sum(self._finished_costs))
+                self._round_cost_n += len(self._finished_costs)
+            else:
+                self.eta = min(self.eta_max, max(0.0, self.eta + self.eta_lr * (mean_c - self.cost_budget)))
             self._last_mean_cost = mean_c
             self._finished_costs = []
+
+    def pop_round_costs(self):
+        """(sum, count) of episode costs finished since the last call (global_eta mode)."""
+        s, n = self._round_cost_sum, self._round_cost_n
+        self._round_cost_sum, self._round_cost_n = 0.0, 0
+        return s, n
+
+    def set_eta(self, eta):
+        self.eta = float(eta)
 
     def _sample_keyframes(self):
         if self.keyframe_sampling == "uniform":

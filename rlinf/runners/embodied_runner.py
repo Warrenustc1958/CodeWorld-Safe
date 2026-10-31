@@ -476,10 +476,44 @@ class EmbodiedRunner:
         self.env.stop_profile().wait()
         self.logger.info(f"Closed profiling window at step {step_idx}")
 
+    def _init_global_eta(self):
+        """env.train.global_eta: one Lagrange multiplier for the whole rollout (see rlinf/algorithms/global_eta.py)."""
+        self.global_eta = None
+        tc = self.cfg.env.get("train", None)
+        if tc is None or not tc.get("global_eta", False):
+            return
+        from rlinf.algorithms.global_eta import GlobalEta
+
+        path = os.path.join(self.cfg.runner.logger.log_path, self.cfg.runner.logger.experiment_name,
+                            "global_eta.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.global_eta = GlobalEta(path, eta_init=tc.get("eta_init", 0.0), eta_lr=tc.get("eta_lr", 0.0),
+                                    eta_max=tc.get("eta_max", float("inf")),
+                                    budget_factor=tc.get("cost_budget_factor", 1.0),
+                                    # a fixed budget only when no calibration factor is given
+                                    budget=None if tc.get("cost_budget_factor", None) is not None
+                                    else tc.get("cost_budget", None))
+        self.global_eta.load(self.global_step)  # resumed run: eta / budget as of the checkpoint
+        self.env.set_global_eta(self.global_eta.eta).wait()
+        self.logger.info(f"[global_eta] step {self.global_step}: eta={self.global_eta.eta} "
+                         f"budget={self.global_eta.state['budget']} state={path}")
+
+    def _update_global_eta(self, step: int):
+        res = self.env.pop_round_costs().wait()
+        flat = res if isinstance(res, (list, tuple)) else [res]
+        pairs = [p for p in flat if isinstance(p, (list, tuple)) and len(p) == 2]
+        cost_sum, cost_n = sum(float(p[0]) for p in pairs), sum(int(p[1]) for p in pairs)
+        eta_next = self.global_eta.update(step, cost_sum, cost_n)
+        self.env.set_global_eta(eta_next).wait()
+        h = self.global_eta.state["history"][-1] if self.global_eta.state["history"] else {}
+        self.logger.info(f"[global_eta] step {step}: mean_cost={h.get('mean_cost')} n={cost_n} "
+                         f"budget={h.get('budget')} eta {h.get('eta')} -> {eta_next}")
+
     def run(self):
         if self.cfg.runner.get("use_training_pipeline", False):
             return self.run_pipeline()
 
+        self._init_global_eta()
         start_step = self.global_step
         start_time = time.time()
         for _step in range(start_step, self.max_steps):
@@ -541,6 +575,10 @@ class EmbodiedRunner:
                     actor_training_metrics = actor_training_handle.wait()
                     if env_bootstrap_handle is not None:
                         env_bootstrap_handle.wait()
+
+                if self.global_eta is not None:
+                    env_handle.wait()  # the rollout of this step has finished on every env worker
+                    self._update_global_eta(_step)
 
                 self.global_step += 1
                 eval_metrics = self._maybe_eval_and_checkpoint(_step)

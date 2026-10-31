@@ -816,6 +816,23 @@ class EnvWorker(Worker):
         adjusted_rewards[:, -1] += self.cfg.algorithm.gamma * final_values
         return adjusted_rewards
 
+    def pop_round_costs(self):
+        """Global eta: (sum, count) of train-episode costs finished since the last call, over this worker."""
+        s, n = 0.0, 0
+        for env in self.env_list:
+            fn = get_env_attr(env, "pop_round_costs")
+            if callable(fn):
+                a, b = fn()
+                s, n = s + float(a), n + int(b)
+        return s, n
+
+    def set_global_eta(self, eta: float):
+        """Global eta: broadcast one Lagrange multiplier to every train env of this worker."""
+        for env in self.env_list:
+            fn = get_env_attr(env, "set_eta")
+            if callable(fn):
+                fn(eta)
+
     def finish_rollout(self, mode="train"):
         # reset
         if mode == "train":
