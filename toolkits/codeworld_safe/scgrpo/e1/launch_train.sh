@@ -13,10 +13,13 @@ log() { echo "[$(date +%H:%M:%S)] [$TAG] $*"; }
 complete() { [ -f $CK/global_step_$1/actor/dcp_checkpoint/.metadata ] && [ -f $CK/global_step_$1/$W ]; }
 steps() { ls -d $CK/global_step_* 2>/dev/null | grep -oE "[0-9]+$" | sort -n; }
 latest() { for s in $(steps); do complete $s && echo $s; done | tail -1; }
+KEEP=${KEEP:-}            # explicit steps to keep (e.g. "10 20 40"); empty = every 10th
+KEEP_LATEST=${KEEP_LATEST:-2}
 prune() {
-  local keep="$(for s in $(steps); do complete $s && echo $s; done | tail -2)"
+  local keep="$(for s in $(steps); do complete $s && echo $s; done | tail -$KEEP_LATEST)"
   for s in $(steps); do
-    [ $((s % 10)) -eq 0 ] && continue
+    if [ -n "$KEEP" ]; then echo " $KEEP " | grep -q " $s " && continue
+    else [ $((s % 10)) -eq 0 ] && continue; fi
     echo "$keep" | grep -qx "$s" && continue
     complete $s || continue
     d=$CK/global_step_$s

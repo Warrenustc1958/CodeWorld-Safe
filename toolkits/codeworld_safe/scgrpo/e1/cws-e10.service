@@ -1,0 +1,16 @@
+[Unit]
+Description=CodeWorld-Safe SC-GRPO E10-O (real reward, 40 steps, then eval 10/20/40) - /data_cf/cws_sam/v1/scgrpo/e10_pipeline.sh
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/data_cf/cws_sam/v1/scgrpo
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash /data_cf/cws_sam/v1/scgrpo/e10_pipeline.sh
+Restart=on-failure
+RestartSec=20
+KillMode=process
+StandardOutput=append:/data_cf/cws_sam/v1/scgrpo/causal/e10night/pipeline.log
+StandardError=append:/data_cf/cws_sam/v1/scgrpo/causal/e10night/pipeline.log

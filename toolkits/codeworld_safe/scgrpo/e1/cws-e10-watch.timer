@@ -1,0 +1,10 @@
+[Unit]
+Description=Every 5 minutes: keep E10-O (cws-e10.service) running until it finishes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
