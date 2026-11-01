@@ -29,7 +29,7 @@ runner:
     experiment_name: "scgrpo_causal_e10o"
     logger_backends: ["tensorboard"]
   max_epochs: 1000
-  max_steps: 80
+  max_steps: 40
   only_eval: False
   val_check_interval: -1    # real-grader eval runs separately on saved checkpoints
   save_interval: 2

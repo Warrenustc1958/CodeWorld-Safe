@@ -32,7 +32,7 @@ runner:
   max_steps: 10
   only_eval: False
   val_check_interval: -1    # real-grader eval runs separately on saved checkpoints
-  save_interval: 5
+  save_interval: 2
   resume_dir: /data_cf/cws_sam/v1/scgrpo/causal/e8b/scgrpo_causal_e8b/checkpoints/global_step_5
   ckpt_path: null
 
