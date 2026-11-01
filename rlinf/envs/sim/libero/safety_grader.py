@@ -234,3 +234,31 @@ def build_graders(task_env, parsed_problem: dict, aux: bool = True,
 
 def grade_step(graders: Sequence[SafetyGrader], task_env) -> list[dict[str, Any]]:
     return [grader.value(task_env) for grader in graders]
+
+
+CHANNELS = ("c_obj", "c_robot", "c_grasp")
+
+
+def violated_channels(graders: Sequence[SafetyGrader], task_env) -> dict[str, bool]:
+    """Boolean ``violated`` per channel, same rule as ``SafetyGrader.value`` without distances/forces.
+
+    Used as the training cost label so training and evaluation share one contact implementation
+    (the LIBERO ``check_robot_contact`` predicate never fires: it matches geom names against ids).
+    """
+    out = dict.fromkeys(CHANNELS, False)
+    for grader in graders:
+        if out[grader.channel]:
+            continue
+        if bool(grader.violated(task_env, _touching(task_env, grader._a, grader._b))):
+            out[grader.channel] = True
+    return out
+
+
+def _touching(task_env, set_a: Sequence[int], set_b: Sequence[int]) -> bool:
+    _, d = _raw(task_env)
+    a, b = set(set_a), set(set_b)
+    for i in range(d.ncon):
+        c = d.contact[i]
+        if (c.geom1 in a and c.geom2 in b) or (c.geom1 in b and c.geom2 in a):
+            return True
+    return False

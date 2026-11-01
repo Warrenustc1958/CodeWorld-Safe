@@ -24,8 +24,9 @@ import torch
 class _RealEnv:
     """Real simulator stub: goal from step `goal_at` on, a violation at step `viol_at` (1-based)."""
 
-    def __init__(self, goal_at=2, viol_at=None, aux_at=None):
+    def __init__(self, goal_at=2, viol_at=None, aux_at=None, ch_at=(None, None, None)):
         self.steps, self.goal_at, self.viol_at, self.aux_at = 0, goal_at, viol_at, aux_at
+        self.ch_at = ch_at  # grader channels (c_obj, c_robot, c_grasp): first violating step
 
     def step(self, action):
         self.steps += 1
@@ -36,7 +37,8 @@ class _RealEnv:
 
 def _make_env(monkeypatch, *, reward_source, termination_source, rm_probs, real_env, max_chunks=1,
               tail_chunks=1, terminate_on_real_violation=False, end_on_violation=False,
-              outcome_order="legacy", reward_rule="once", cost_source="sam", eta=0.0):
+              outcome_order="legacy", reward_rule="once", cost_source="sam", eta=0.0,
+              cost_label="predicate", cost_window="goal", obs_source="wan"):
     import rlinf.envs.sim.libero.safety_auditor as auditor
     from rlinf.envs.sim.world_model.safe.sync_real_env import SyncRealWorldModelEnv
 
@@ -69,8 +71,21 @@ def _make_env(monkeypatch, *, reward_source, termination_source, rm_probs, real_
     env.ended = torch.zeros(1, dtype=torch.bool)
     env.step_costs, env.cost_by_depth = torch.zeros(1, T), torch.zeros(1, max_chunks)
     env.top_m, env.eta = 8, eta
-    env.cost_source = cost_source
+    env.cost_source, env.cost_label, env.cost_window = cost_source, cost_label, cost_window
+    env.obs_source = obs_source
+    env.noise_fp = env.noise_fn = 0.0
+    env.dump_dir, env._reset_count, env.group_size = None, 1, 1
+    env.dump_arrays = False
+    env.rm_frames = None
+    env.dumped = np.zeros(1, dtype=bool)
+    env.first_viol = np.full((1, 3), -1)
+    env.rm_chunk_max = np.full((1, max_chunks), np.nan, np.float32)
+    env.kf, env._kf_uid, env._records = np.zeros(1, dtype=np.int64), ["u0"], {"u0": {"suite": "affordance"}}
     env.c_off, env.c_aux = np.zeros(1, dtype=bool), np.zeros(1, dtype=bool)
+    env.c_ch, env.c_ch_ep, env.c_ch_reset = (np.zeros((1, 3), dtype=bool) for _ in range(3))
+    # grader stub: channel j violated from step ch_at[j] on (1-based), like the real contact grader
+    env._grader_channels = lambda i: np.array(
+        [a is not None and env._real[i].steps >= a for a in getattr(env._real[i], "ch_at", (None,) * 3)])
     env.state_offset, env.ep_cost = torch.zeros(1, 1), torch.zeros(1)
     env.success_once = torch.zeros(1, dtype=torch.bool)
     env.returns, env._finished_costs = torch.zeros(1), []
@@ -193,10 +208,12 @@ def test_reward_model_gets_agent_or_agent_plus_wrist(monkeypatch, views, rows):
 
 
 # ---------------------------------------------------------------- E11: real event cost + global eta
-def _real_cost_run(monkeypatch, real_env, eta=1.0, cost_source="real"):
+def _real_cost_run(monkeypatch, real_env, eta=1.0, cost_source="real", cost_label="predicate",
+                   cost_window="goal"):
     env = _make_env(monkeypatch, reward_source="real", termination_source="horizon",
                     rm_probs=[torch.zeros(8)], real_env=real_env, tail_chunks=1,
-                    outcome_order="step", cost_source=cost_source, eta=eta)
+                    outcome_order="step", cost_source=cost_source, eta=eta,
+                    cost_label=cost_label, cost_window=cost_window)
     _, rewards, _, truncations, info = env.chunk_step(torch.zeros(1, 8, 7))
     assert truncations[0, -1]
     return env, rewards[0, -1].item(), info[0]["episode"]
@@ -236,6 +253,266 @@ def test_sam_cost_source_unchanged(monkeypatch):
     assert ep["cost_official"][0].item() == 1.0  # still logged for diagnosis
 
 
+@pytest.mark.parametrize(
+    ("ch_at", "goal_at", "window", "cost", "per_channel", "ep_channel"),
+    [
+        ((None, 3, None), 5, "goal", 1.0, (0, 1, 0), (0, 1, 0)),     # robot contact the predicate misses
+        ((None, 6, None), 3, "goal", 0.0, (0, 0, 0), (0, 1, 0)),     # robot contact after the goal
+        ((None, 6, None), 3, "episode", 1.0, (0, 1, 0), (0, 1, 0)),  # ... counted with the episode window
+        ((2, None, 4), None, "goal", 1.0, (1, 0, 1), (1, 0, 1)),     # object + wrong grasp, no goal
+        ((None, None, None), 5, "goal", 0.0, (0, 0, 0), (0, 0, 0)),
+    ],
+)
+def test_grader_cost_label(monkeypatch, ch_at, goal_at, window, cost, per_channel, ep_channel):
+    # predicates report nothing (viol_at / aux_at None): only the grader sees the contact
+    env, _, ep = _real_cost_run(monkeypatch, _RealEnv(goal_at=goal_at, ch_at=ch_at),
+                                cost_label="grader", cost_window=window)
+    assert ep["cost"][0].item() == cost
+    assert ep["cost_official"][0].item() == 0.0 and ep["cost_aux"][0].item() == 0.0
+    assert tuple(int(ep[f"cost_{c}"][0].item()) for c in ("obj", "robot", "grasp")) == per_channel
+    assert tuple(int(ep[f"unsafe_ep_{c}"][0].item()) for c in ("obj", "robot", "grasp")) == ep_channel
+    assert env._finished_costs == [cost]
+
+
+def test_grader_label_does_not_change_termination(monkeypatch):
+    # a grader-only robot contact must not end the episode: termination still follows official predicates
+    env = _make_env(monkeypatch, reward_source="real", termination_source="real",
+                    rm_probs=[torch.zeros(8)], real_env=_RealEnv(goal_at=None, ch_at=(None, 2, None)),
+                    terminate_on_real_violation=True, end_on_violation=True, outcome_order="step",
+                    cost_source="real", cost_label="grader", eta=1.0)
+    _, rewards, terminations, truncations, info = env.chunk_step(torch.zeros(1, 8, 7))
+    assert not terminations[0, -1] and truncations[0, -1]
+    assert env._real[0].steps == 8  # all 8 steps executed
+    assert info[0]["episode"]["cost"][0].item() == 1.0
+    assert rewards[0, -1].item() == pytest.approx(-1.0)
+
+
+@pytest.mark.parametrize(
+    ("goal_at", "fp", "fn", "u", "paid"),
+    [
+        (None, 1.0, 0.0, 0.5, 1.0),   # real failure paid as success (false positive)
+        (None, 0.3, 0.0, 0.5, 0.0),   # draw above fp: no flip
+        (3, 0.0, 1.0, 0.5, 0.0),      # real success paid as failure (false negative)
+        (3, 0.0, 0.3, 0.5, 1.0),      # draw above fn: no flip
+        (3, 0.0, 0.0, 0.0, 1.0),      # no noise: unchanged
+    ],
+)
+def test_reward_noise_flips_paid_outcome(monkeypatch, goal_at, fp, fn, u, paid):
+    env = _make_env(monkeypatch, reward_source="real", termination_source="horizon",
+                    rm_probs=[torch.zeros(8)], real_env=_RealEnv(goal_at=goal_at), tail_chunks=1,
+                    outcome_order="step")
+    env.noise_fp, env.noise_fn, env.noise_u = fp, fn, np.array([u])
+    _, rewards, _, truncations, info = env.chunk_step(torch.zeros(1, 8, 7))
+    assert truncations[0, -1]
+    assert rewards[0, -1].item() == paid
+    assert info[0]["episode"]["success_once"][0].item() == paid
+    # the real outcome is still logged unflipped
+    assert info[0]["episode"]["real_success"][0].item() == float(goal_at is not None)
+
+
+def test_episode_dump(monkeypatch, tmp_path):
+    import json
+
+    env2 = _make_env(monkeypatch, reward_source="real", termination_source="horizon",
+                     rm_probs=[torch.full((8,), 0.9)], real_env=_RealEnv(goal_at=6, ch_at=(None, 3, None)),
+                     tail_chunks=1, outcome_order="step", cost_source="real", cost_label="grader", eta=0.5)
+    env2.dump_dir = str(tmp_path)
+    env2.chunk_step(torch.zeros(1, 8, 7))
+    files = list(tmp_path.glob("episodes_*.jsonl"))
+    assert len(files) == 1
+    rows = [json.loads(l) for l in files[0].read_text().splitlines()]
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["real_success"] and r["real_success_step"] == 5 and r["suite"] == "affordance"
+    assert r["grader_window"] == [0, 1, 0] and r["first_viol_step"] == [-1, 2, -1]
+    assert r["rm_chunk_max"][0] == pytest.approx(0.9) and r["rm_success_once"]
+    assert r["cost_used"] == 1.0 and r["reward"] == pytest.approx(0.5) and r["paid_success"]
+    assert len(r["sam_step_cost"]) == 8
+    env2.chunk_step  # episode already dumped: a second call must not duplicate it
+    assert env2.dumped[0]
+
+
+def test_episode_array_dump(monkeypatch, tmp_path):
+    import io
+    import json
+
+    from PIL import Image
+
+    env = _make_env(monkeypatch, reward_source="real", termination_source="horizon",
+                    rm_probs=[torch.zeros(8)], real_env=_RealEnv(goal_at=6, ch_at=(None, 3, None)),
+                    tail_chunks=1, outcome_order="step", cost_source="real", cost_label="grader")
+    env.dump_dir, env.dump_arrays = str(tmp_path), True
+    env.arr_jpg, env.arr_z, env.arr_a = [[]], [[]], [[]]
+    env.step_goal, env.step_exec = np.zeros((1, 8), bool), np.zeros((1, 8), bool)
+    env.step_ch = np.zeros((1, 8, 3), bool)
+    ramp = np.broadcast_to(np.arange(256, dtype=np.uint8)[None, :, None], (512, 256, 3))
+    frames = np.stack([ramp] * 8)[None].copy()  # smooth image: JPEG round trip stays close
+    env._generate = lambda actions: (frames, torch.ones(1, 48, 4, 32, 16))
+    env.chunk_step(torch.full((1, 8, 7), 0.5))
+    row = json.loads(next(tmp_path.glob("episodes_*.jsonl")).read_text())
+    d = np.load(tmp_path / "arrays" / row["arrays"])
+    off = d["jpg_off"]
+    assert len(off) == 3  # mid and last frame of the single chunk
+    img = np.asarray(Image.open(io.BytesIO(d["jpg"][off[0]:off[1]].tobytes())))
+    assert img.shape == (512, 256, 3) and np.abs(img.astype(int) - ramp.astype(int)).mean() < 3
+    assert d["z"].shape == (1, 48, 4, 32, 16) and d["z"].dtype == np.float16
+    assert d["actions"].shape == (1, 8, 7) and np.allclose(d["actions"], 0.5)
+    assert d["step_exec"].all()
+    assert d["step_goal"].tolist() == [False] * 5 + [True] * 3
+    assert d["step_ch"][:, 1].tolist() == [False] * 2 + [True] * 6 and not d["step_ch"][:, [0, 2]].any()
+
+
+def test_rm_frames_scores_only_selected_frames(monkeypatch):
+    seen = {}
+
+    def predict(frames, instructions):
+        seen["n"], seen["inst"] = frames.shape[0], list(instructions)
+        return torch.tensor([[0.2], [0.95]])  # frame 3 below, frame 7 over the threshold
+
+    env = _make_env(monkeypatch, reward_source="rm", termination_source="horizon",
+                    rm_probs=[torch.zeros(8)], real_env=_RealEnv(goal_at=None), tail_chunks=1, outcome_order="step")
+    env.reward_model = SimpleNamespace(predict_rew=predict, views=2)
+    env.rm_frames, env.success_consecutive, env.success_threshold = [3, 7], 1, 0.9
+    _, rewards, _, _, info = env.chunk_step(torch.zeros(1, 8, 7))
+    assert seen["n"] == 2 and seen["inst"] == ["task", "task"]
+    assert env.last_p_succ[0].tolist() == pytest.approx([0, 0, 0, 0.2, 0, 0, 0, 0.95])
+    assert info[0]["episode"]["rm_success_once"][0].item() == 1.0
+    assert rewards[0, -1].item() == 1.0  # RM reward paid (real goal never reached)
+
+
+@pytest.mark.parametrize(("rf", "consecutive", "match"), [([8], 1, "rm_frames"), ([3, 7], 4, "consecutive")])
+def test_rm_frames_validated(monkeypatch, rf, consecutive, match):
+    from rlinf.envs.sim.world_model.safe import safe_env as se
+    from rlinf.envs.sim.world_model.safe.sync_real_env import SyncRealWorldModelEnv
+
+    def parent_init(self, *a, **k):
+        self.max_chunks, self.release_coef, self.chunk, self.success_consecutive = 8, 0.0, 8, consecutive
+
+    monkeypatch.setattr(se.SafeWorldModelEnv, "__init__", parent_init)
+    with pytest.raises(ValueError, match=match):
+        SyncRealWorldModelEnv({"reward_source": "real", "termination_source": "horizon", "end_on_violation": False,
+                               "success_tail_chunks": 8, "rm_frames": rf, "episodes_jsonl": "/nonexistent",
+                               "keyframe_dir": "/nonexistent"})
+
+
+def test_qwen_rm_client_round_trip(monkeypatch):
+    import base64
+    import io
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from PIL import Image
+
+    from rlinf.models.embodiment.reward.qwen_rm_client import QwenRMClient
+
+    got = {}
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            imgs = [np.asarray(Image.open(io.BytesIO(base64.b64decode(x)))) for x in req["jpg"]]
+            got["shape"], got["mean"], got["inst"] = imgs[0].shape, float(imgs[0].mean()), req["instructions"]
+            body = json.dumps({"p": [0.1 * (i + 1) for i in range(len(imgs))]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    client = QwenRMClient(port_base=srv.server_address[1]).eval()
+    obs = torch.zeros(2, 3, 512, 256)  # mid-grey in [-1, 1]
+    p = client.predict_rew(obs, ["t1", "t2"])
+    srv.shutdown()
+    assert p.shape == (2, 1) and p[:, 0].tolist() == pytest.approx([0.1, 0.2])
+    assert got["shape"] == (512, 256, 3) and abs(got["mean"] - 127.5) < 2 and got["inst"] == ["t1", "t2"]
+
+
+@pytest.mark.parametrize(("cfg", "match"), [({"reward_noise": {"fp": 0.1}, "reward_source": "rm",
+                                               "termination_source": "horizon"}, "reward_noise"),
+                                             ({"reward_noise": {"fp": 1.5}}, "reward_noise")])
+def test_reward_noise_validated(monkeypatch, cfg, match):
+    with pytest.raises(ValueError, match=match):
+        _init_sync_env(monkeypatch, **cfg)
+
+
+def test_weighted_keyframe_sampling():
+    from rlinf.envs.sim.world_model.safe.safe_env import SafeWorldModelEnv
+
+    env = SafeWorldModelEnv.__new__(SafeWorldModelEnv)
+    env.keyframe_sampling, env.num_group, env.group_size = "weighted", 4000, 2
+    env.kf_pool = np.array([10, 11, 12])
+    env.kf_pool_w = torch.tensor([1.0, 3.0, 0.0], dtype=torch.float64)
+    env._generator = torch.Generator().manual_seed(0)
+    kf = env._sample_keyframes()
+    assert kf.shape == (8000,) and (kf[0::2] == kf[1::2]).all()  # each group repeats one keyframe
+    assert 12 not in kf  # zero weight is never drawn
+    share = (kf[0::2] == 11).mean()
+    assert 0.72 < share < 0.78  # 3 : 1
+
+
+class _RenderingRealEnv(_RealEnv):
+    """Real simulator stub that also returns observations: images encode the step index."""
+
+    def step(self, action):
+        super().step(action)
+        img = np.full((256, 256, 3), self.steps, np.uint8)
+        img[0, 0] = 200  # marks the unrotated top-left corner
+        return ({"agentview_image": img, "robot0_eye_in_hand_image": img + 100,
+                 "robot0_eef_pos": np.full(3, self.steps, np.float64),
+                 "robot0_eef_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+                 "robot0_gripper_qpos": np.array([0.01, -0.01])}, 0.0, False, {})
+
+
+def test_real_observation_frames_and_state(monkeypatch):
+    env = _make_env(monkeypatch, reward_source="real", termination_source="horizon",
+                    rm_probs=[torch.zeros(8)], real_env=_RenderingRealEnv(goal_at=None), tail_chunks=1,
+                    outcome_order="step", cost_source="real", cost_label="grader", obs_source="real")
+    env.last_frame = torch.zeros(1, 512, 256, 3, dtype=torch.uint8)
+    env.states = torch.zeros(1, 8)
+    env._generate = lambda actions: pytest.fail("Wan must not run with obs_source=real")
+    env.sam = lambda *a: pytest.fail("SAM must not run with obs_source=real")
+    env.state_reader = lambda frame: pytest.fail("state regressor must not run with obs_source=real")
+    env.main_size = env.wrist_size = 256
+    from rlinf.envs.sim.world_model.safe.safe_env import SafeWorldModelEnv
+    env._wrap_obs = lambda: SafeWorldModelEnv._wrap_obs(env)
+    obs, _, _, truncations, info = env.chunk_step(torch.zeros(1, 8, 7))
+    assert truncations[0, -1]
+    f = env.last_frames[0]
+    assert [int(f[k, 100, 100, 0]) for k in range(8)] == list(range(1, 9))   # agent view, one render per step
+    assert int(f[7, 356, 100, 0]) == 108                                         # wrist view in the bottom half
+    assert f[7, 255, 255, 0] == 200 and f[7, 0, 0, 0] == 8                       # rotated 180 deg
+    assert env.states[0, :3].tolist() == [8.0, 8.0, 8.0]
+    assert env.states[0, 6:].tolist() == pytest.approx([0.01, -0.01])
+    assert int(obs[0]["main_images"][0, 100, 100, 0]) == 8                        # policy sees the last render
+    assert info[0]["episode"]["cost_sam"][0].item() == 0.0
+
+
+@pytest.mark.parametrize(("visible", "expected"), [("3", "2"), ("4,5", "7"), ("0", "1"), ("", "1")])
+def test_render_egl_remap(monkeypatch, visible, expected):
+    from rlinf.envs.sim.world_model.safe.sync_real_env import SyncRealWorldModelEnv
+
+    env = SyncRealWorldModelEnv.__new__(SyncRealWorldModelEnv)
+    env.render_egl_remap = {3: 2, 4: 7}
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+    monkeypatch.setenv("MUJOCO_EGL_DEVICE_ID", "1")  # what RLinf set for the worker
+    monkeypatch.setenv("EGL_DEVICE_ID", "1")
+    env._set_render_device()
+    assert __import__("os").environ["MUJOCO_EGL_DEVICE_ID"] == expected
+    assert __import__("os").environ["EGL_DEVICE_ID"] == expected
+
+
+def test_real_observation_requires_real_cost(monkeypatch):
+    with pytest.raises(ValueError, match="obs_source"):
+        _init_sync_env(monkeypatch, cost_source="sam", obs_source="real")
+    assert _init_sync_env(monkeypatch, cost_source="real", obs_source="real") == "passed option checks"
+
+
 def _init_sync_env(monkeypatch, **cfg):
     """Run SyncRealWorldModelEnv.__init__ with the parent (model loading) stubbed out, up to the
     option checks; returns the env or raises the option error."""
@@ -262,10 +539,18 @@ def test_real_cost_requires_aux_labels(monkeypatch, aux_env, ok):
     else:
         monkeypatch.setenv("RLINF_LIBERO_SAFETY_AUX", aux_env)
     if ok:
-        assert _init_sync_env(monkeypatch, cost_source="real") == "passed option checks"
+        assert _init_sync_env(monkeypatch, cost_source="real", cost_label="predicate") == "passed option checks"
     else:
         with pytest.raises(ValueError, match="RLINF_LIBERO_SAFETY_AUX"):
-            _init_sync_env(monkeypatch, cost_source="real")
+            _init_sync_env(monkeypatch, cost_source="real", cost_label="predicate")
+    # the grader label builds its own auxiliary graders: no environment flag needed
+    assert _init_sync_env(monkeypatch, cost_source="real") == "passed option checks"
+
+
+@pytest.mark.parametrize(("key", "value"), [("cost_label", "bogus"), ("cost_window", "bogus")])
+def test_cost_label_and_window_validated(monkeypatch, key, value):
+    with pytest.raises(ValueError, match=key):
+        _init_sync_env(monkeypatch, cost_source="real", **{key: value})
 
 
 def test_sam_cost_source_needs_no_aux_labels(monkeypatch):

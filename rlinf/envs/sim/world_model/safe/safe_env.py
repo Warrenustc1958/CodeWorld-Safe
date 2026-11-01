@@ -100,11 +100,23 @@ class SafeWorldModelEnv:
             keep &= np.isin(meta["suite"], list(cfg.keyframe_suites))
         if cfg.get("keyframe_roles", None):
             keep &= np.isin(meta["role"], list(cfg.keyframe_roles))
+        # keyframe_exclude: .npy of keyframe indices to drop (e.g. a safety violation already at the keyframe)
+        if cfg.get("keyframe_exclude", None):
+            keep[np.load(cfg.keyframe_exclude).astype(np.int64)] = False
         self.kf_pool = np.flatnonzero(keep)
         if not len(self.kf_pool):
             raise ValueError("No keyframes match the selected suites and roles")
         self.keyframe_sampling = str(cfg.get("keyframe_sampling", "uniform"))
-        if self.keyframe_sampling == "balanced_tcell":
+        if self.keyframe_sampling == "weighted":
+            # keyframe_weights: .npy, one non-negative weight per keyframe; groups are drawn proportionally
+            w = np.load(cfg.keyframe_weights).astype(np.float64)
+            if w.shape != (len(self.kf_task),) or (w < 0).any():
+                raise ValueError(f"keyframe_weights must be {len(self.kf_task)} non-negative values")
+            self.kf_pool = self.kf_pool[w[self.kf_pool] > 0]
+            if not len(self.kf_pool):
+                raise ValueError("keyframe_weights leave no keyframe in the pool")
+            self.kf_pool_w = torch.from_numpy(w[self.kf_pool])
+        elif self.keyframe_sampling == "balanced_tcell":
             cells = np.asarray(self.kf_tcell)
             self.kf_cell_pools = [
                 self.kf_pool[cells[self.kf_pool] == cell]
@@ -153,9 +165,15 @@ class SafeWorldModelEnv:
         self.pipe = pipe
         self.sam = SAMNet.from_checkpoint(self.cfg.sam_path).to(self.device)
         self.state_reader = StateReader(self.cfg.state_reader_path).to(self.device)
-        from rlinf.models.embodiment.reward.cws_reward_model import CWSRewardModel
+        if self.cfg.reward_model.get("type", "CWSRewardModel") == "QwenRMClient":  # Qwen3-VL RM in a local server
+            from rlinf.models.embodiment.reward.qwen_rm_client import QwenRMClient
 
-        self.reward_model = CWSRewardModel.from_checkpoint(self.cfg.reward_model.from_pretrained).eval().to(self.device)
+            self.reward_model = QwenRMClient(int(self.cfg.reward_model.port_base)).eval().to(self.device)
+        else:
+            from rlinf.models.embodiment.reward.cws_reward_model import CWSRewardModel
+
+            self.reward_model = CWSRewardModel.from_checkpoint(
+                self.cfg.reward_model.from_pretrained).eval().to(self.device)
 
     # ------------------------------------------------------------------ gym-ish properties
     @property
@@ -206,6 +224,9 @@ class SafeWorldModelEnv:
                 0, len(self.kf_pool), (self.num_group,), generator=self._generator
             ).numpy()
             selected = self.kf_pool[g]
+        elif self.keyframe_sampling == "weighted":
+            g = torch.multinomial(self.kf_pool_w, self.num_group, replacement=True, generator=self._generator)
+            selected = self.kf_pool[g.numpy()]
         else:
             cells = torch.randint(
                 0, len(self.kf_cell_pools), (self.num_group,),

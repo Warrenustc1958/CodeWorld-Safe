@@ -89,15 +89,63 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         if self.reward_rule not in ("once", "final"):
             raise ValueError(f"Unknown success_reward_rule: {self.reward_rule}")
         # cost_source: sam = top-M mean of SAM step costs (original); real = 0/1 event cost from the synchronised
-        # simulator: an official or auxiliary (wrong grasp part, extra human contact, ...) violation from the
-        # start up to and including the first real goal step. SAM is still computed and logged as cost_sam.
+        # simulator (label and window below). SAM is still computed and logged as cost_sam. Termination still
+        # follows the official predicates, so the benchmark protocol is unchanged.
         self.cost_source = str(cfg.get("cost_source", "sam"))
         if self.cost_source not in ("sam", "real"):
             raise ValueError(f"Unknown cost_source: {self.cost_source}")
-        if self.cost_source == "real" and os.environ.get("RLINF_LIBERO_SAFETY_AUX") != "1":
-            raise ValueError("cost_source=real needs RLINF_LIBERO_SAFETY_AUX=1 (auxiliary violations)")
+        # cost_label (cost_source=real): grader = binary ``violated`` of safety_grader on all three channels
+        # (c_obj / c_robot / c_grasp), the same implementation the real-eval grader uses; predicate = the
+        # LIBERO official + auxiliary predicates (E11, legacy: check_robot_contact never fires, so c_robot is 0).
+        self.cost_label = str(cfg.get("cost_label", "grader"))
+        if self.cost_label not in ("grader", "predicate"):
+            raise ValueError(f"Unknown cost_label: {self.cost_label}")
+        # cost_window: goal = from the start up to and including the first real goal step; episode = all executed steps
+        self.cost_window = str(cfg.get("cost_window", "goal"))
+        if self.cost_window not in ("goal", "episode"):
+            raise ValueError(f"Unknown cost_window: {self.cost_window}")
+        if (self.cost_source == "real" and self.cost_label == "predicate"
+                and os.environ.get("RLINF_LIBERO_SAFETY_AUX") != "1"):
+            raise ValueError("cost_label=predicate needs RLINF_LIBERO_SAFETY_AUX=1 (auxiliary violations)")
+        # obs_source: wan = policy sees Wan-generated frames (original); real = policy sees the synchronised simulator's
+        # renders (agent + wrist, 256 px, rotated 180 deg like keyframes_v1) and its robot state. Wan is not called, so
+        # SAM costs are unavailable: obs_source=real needs cost_source=real.
+        self.obs_source = str(cfg.get("obs_source", "wan"))
+        if self.obs_source not in ("wan", "real"):
+            raise ValueError(f"Unknown obs_source: {self.obs_source}")
+        if self.obs_source == "real" and self.cost_source != "real":
+            raise ValueError("obs_source=real needs cost_source=real (SAM needs Wan latents)")
+        # render_egl_remap (obs_source=real with MUJOCO_GL=egl): {worker CUDA device: EGL device index} so a worker
+        # renders on another GPU (e.g. off GPUs with EGL faults). EGL indices follow eglQueryDevicesEXT, not CUDA ids.
+        self.render_egl_remap = {int(k): int(v) for k, v in (cfg.get("render_egl_remap") or {}).items()}
         # diagnostics only: per real step, record goal / wrong-grasp-part (aux) / official violation
         self.record_steps = bool(cfg.get("record_steps", False))
+        # reward_noise {fp, fn} (diagnostic, reward_source=real): per episode and independently of the trajectory, a real
+        # failure is paid as success with probability fp and a real success as failure with probability fn
+        noise = cfg.get("reward_noise") or {}
+        self.noise_fp, self.noise_fn = float(noise.get("fp", 0.0)), float(noise.get("fn", 0.0))
+        if not (0.0 <= self.noise_fp <= 1.0 and 0.0 <= self.noise_fn <= 1.0):
+            raise ValueError(f"reward_noise rates must be in [0, 1], got {noise}")
+        if (self.noise_fp or self.noise_fn) and self.reward_source != "real":
+            raise ValueError("reward_noise needs reward_source=real")
+        self._noise_rng = None
+        # dump_dir: append one JSON line per finished episode (ids, real outcome, RM / SAM / grader signals, paid reward)
+        self.dump_dir = cfg.get("dump_dir")
+        self._reset_count = 0
+        # dump_arrays: also write dump_dir/arrays/<pid>_<reset>_<slot>.npz per episode: JPEGs of the mid and last frame of
+        # every chunk (agent over wrist), Wan latents, actions, and per-step goal / grader channels / executed masks
+        self.dump_arrays = bool(cfg.get("dump_arrays", False))
+        if self.dump_arrays and not self.dump_dir:
+            raise ValueError("dump_arrays needs dump_dir")
+        # rm_frames: in-chunk frame indices the RM scores (others count as 0), e.g. [3, 7] = the mid and end frame that
+        # the phase-2 RM dataset uses; needs success_consecutive 1. None = all frames (original).
+        rf = cfg.get("rm_frames", None)
+        self.rm_frames = None if rf is None else sorted(int(x) for x in rf)
+        if self.rm_frames is not None:
+            if not self.rm_frames or self.rm_frames[0] < 0 or self.rm_frames[-1] >= self.chunk:
+                raise ValueError(f"rm_frames must be in [0, {self.chunk}), got {rf}")
+            if self.success_consecutive != 1:
+                raise ValueError("rm_frames needs success_consecutive 1")
         if self.release_coef > 0:
             raise ValueError("SyncRealWorldModelEnv does not implement the release penalty")
         self._records = {}
@@ -122,16 +170,37 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         return self._suites[name]
 
     def _make_env(self, suite, task_id):
+        if self.obs_source == "real":
+            self._set_render_device()  # before LIBERO imports robosuite
         from libero.libero.envs.env_wrapper import ControlEnv
 
         s = self._suite(suite)
         task = s.get_task(task_id)
-        env = ControlEnv(bddl_file_name=s.get_task_bddl_file_path(task.level, task.level_id),
-                         has_offscreen_renderer=False, use_camera_obs=False, ignore_done=True, horizon=100000)
+        if self.obs_source == "real":
+            from libero.libero.envs.env_wrapper import OffScreenRenderEnv
+
+            env = OffScreenRenderEnv(bddl_file_name=s.get_task_bddl_file_path(task.level, task.level_id),
+                                     camera_heights=256, camera_widths=256, ignore_done=True, horizon=100000)
+        else:
+            env = ControlEnv(bddl_file_name=s.get_task_bddl_file_path(task.level, task.level_id),
+                             has_offscreen_renderer=False, use_camera_obs=False, ignore_done=True, horizon=100000)
         if hasattr(env, "seed"):
             env.seed(self.seed)
         env.reset()
         return env
+
+    def _set_render_device(self):
+        """Apply render_egl_remap for this worker's GPU (first CUDA_VISIBLE_DEVICES entry) before a renderer exists."""
+        gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0]
+        target = os.environ.get("MUJOCO_EGL_DEVICE_ID")  # RLinf: EGL index of the worker's GPU
+        if gpu.isdigit() and int(gpu) in self.render_egl_remap:
+            target = str(self.render_egl_remap[int(gpu)])
+        # robosuite's import-time check wants MUJOCO_EGL_DEVICE_ID to be a CUDA id in CUDA_VISIBLE_DEVICES, which an
+        # EGL index generally is not; import it without the variable, the EGL context reads it again at creation.
+        os.environ.pop("MUJOCO_EGL_DEVICE_ID", None)
+        import robosuite.utils.binding_utils  # noqa: F401
+        if target is not None:
+            os.environ["MUJOCO_EGL_DEVICE_ID"] = os.environ["EGL_DEVICE_ID"] = target
 
     def _raw_snapshot(self, index):
         if index in self._raw_snaps:
@@ -183,6 +252,35 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         _restore_simulator_state(env, snap)
         self._real[slot], self._real_key[slot] = env, key
 
+    def _grader_channels(self, slot):
+        """[c_obj, c_robot, c_grasp] binary violations of the slot's real simulator (safety_grader, aux on)."""
+        from rlinf.envs.sim.libero.safety_grader import CHANNELS, build_graders, violated_channels
+        from rlinf.envs.sim.libero.venv import _unwrap_task_env
+
+        task_env = _unwrap_task_env(self._real[slot])
+        cache = getattr(task_env, "_rlinf_cost_graders", None)
+        if cache is None or cache[0] is not task_env.sim.model:
+            cache = (task_env.sim.model, build_graders(task_env, task_env.parsed_problem, aux=True))
+            task_env._rlinf_cost_graders = cache
+        v = violated_channels(cache[1], task_env)
+        return np.array([v[c] for c in CHANNELS], bool)
+
+    @staticmethod
+    def _real_frame(obs):
+        """Agent over wrist, uint8 [512, 256, 3], rotated 180 deg like the keyframes_v1 / Wan frames."""
+        return np.concatenate([obs["agentview_image"][::-1, ::-1], obs["robot0_eye_in_hand_image"][::-1, ::-1]], 0)
+
+    @staticmethod
+    def _real_state(obs):
+        """8-d robot state as in keyframes_v1: eef pos, eef axis-angle, gripper qpos."""
+        from robosuite.utils.transform_utils import quat2axisangle
+
+        return np.concatenate([obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]),
+                               obs["robot0_gripper_qpos"]]).astype(np.float32)
+
+    def _real_obs_now(self, slot):
+        return self._real[slot].env._get_observations(force_update=True)
+
     # ------------------------------------------------------------------ reset
     @torch.no_grad()
     def reset(self, *, seed=None, options=None, episode_indices=None, env_idx=None):
@@ -199,6 +297,13 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         self.real_viol = np.zeros(n, bool)
         self.c_off = np.zeros(n, bool)  # official violation up to and including the first goal step
         self.c_aux = np.zeros(n, bool)  # auxiliary violation, same window
+        # grader labels per channel (c_obj, c_robot, c_grasp): in the cost window / over the whole episode / at reset
+        self.c_ch = np.zeros((n, 3), bool)
+        self.c_ch_ep = np.zeros((n, 3), bool)
+        self.c_ch_reset = np.zeros((n, 3), bool)
+        if self.cost_source == "real" and self.cost_label == "grader":
+            for i in range(n):
+                self.c_ch_reset[i] = self._grader_channels(i)
         self.real_done = self.real_succ.copy()
         self.real_succ_step = np.where(self.real_succ, 0, -1)
         self.tail_left = np.full(n, -1)  # chunks still to run after the first real success
@@ -206,42 +311,90 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         self.rm_success_once = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.last_real_goal = np.zeros((n, self.chunk), bool)
         self.last_goal = self.real_succ.copy()  # goal predicate at the last executed real step
+        self._reset_count += 1
+        if self.noise_fp or self.noise_fn:  # one uniform draw per episode decides its flip
+            if self._noise_rng is None:  # seeded per worker process so workers draw different flips
+                self._noise_rng = np.random.default_rng([int(self.seed), os.getpid()])
+            self.noise_u = self._noise_rng.random(n)
+        self.dumped = np.zeros(n, bool)
+        self.first_viol = np.full((n, 3), -1)  # first step of each grader channel violation (-1 = none)
+        self.rm_chunk_max = np.full((n, self.max_chunks), np.nan, np.float32)
+        if self.dump_arrays:
+            self.arr_jpg, self.arr_z, self.arr_a = ([[] for _ in range(n)] for _ in range(3))
+            self.step_goal = np.zeros((n, self.max_episode_steps), bool)
+            self.step_ch = np.zeros((n, self.max_episode_steps, 3), bool)
+            self.step_exec = np.zeros((n, self.max_episode_steps), bool)
+        if self.obs_source == "real":
+            o = [self._real_obs_now(i) for i in range(n)]
+            self.last_frame = torch.from_numpy(np.stack([self._real_frame(x) for x in o])).to(self.device)
+            self.states = torch.from_numpy(np.stack([self._real_state(x) for x in o])).to(self.device)
+            obs = self._wrap_obs()
         return obs, info
 
+    def _dump(self, slots, paid, C, C_sam, rewards):
+        """Append one JSON line per finished episode to dump_dir/episodes_<pid>.jsonl (group = consecutive slots)."""
+        if len(slots) == 0:
+            return
+        os.makedirs(os.path.join(self.dump_dir, "arrays") if self.dump_arrays else self.dump_dir, exist_ok=True)
+        g = int(getattr(self, "group_size", 1) or 1)
+        with open(os.path.join(self.dump_dir, f"episodes_{os.getpid()}.jsonl"), "a") as f:
+            for i in slots:
+                kf = int(self.kf[i])
+                uid = self._kf_uid[kf]
+                row = {
+                    "reset": self._reset_count, "slot": int(i), "group": int(i) // g, "kf": kf, "uid": uid,
+                    "suite": self._records.get(uid, {}).get("suite"),
+                    "real_success": bool(self.real_succ[i]), "real_success_step": int(self.real_succ_step[i]),
+                    "official_violation": bool(self.real_viol[i]),
+                    "rm_success_once": bool(self.rm_success_once[i]),
+                    "rm_chunk_max": [None if np.isnan(x) else round(float(x), 4) for x in self.rm_chunk_max[i]],
+                    "cost_sam": round(float(C_sam[i]), 4), "cost_used": round(float(C[i]), 4),
+                    "grader_window": self.c_ch[i].astype(int).tolist(),
+                    "grader_episode": self.c_ch_ep[i].astype(int).tolist(),
+                    "grader_at_reset": self.c_ch_reset[i].astype(int).tolist(),
+                    "first_viol_step": [int(x) for x in self.first_viol[i]],
+                    "sam_step_cost": [round(float(x), 3) for x in self.step_costs[i].tolist()],
+                    "paid_success": bool(paid[i]), "reward": round(float(rewards[i, -1]), 4),
+                    "eta": float(self.eta)}
+                if self.dump_arrays:
+                    name = f"{os.getpid()}_{self._reset_count}_{int(i)}.npz"
+                    jpgs = self.arr_jpg[i]
+                    np.savez(os.path.join(self.dump_dir, "arrays", name),
+                             jpg=np.frombuffer(b"".join(jpgs), np.uint8),
+                             jpg_off=np.cumsum([0] + [len(x) for x in jpgs]).astype(np.int64),
+                             z=np.stack(self.arr_z[i]) if self.arr_z[i] else np.zeros(0, np.float16),
+                             actions=np.stack(self.arr_a[i]), step_goal=self.step_goal[i],
+                             step_ch=self.step_ch[i], step_exec=self.step_exec[i])
+                    row["arrays"] = name
+                f.write(json.dumps(row) + "\n")
+                self.dumped[i] = True
+
+    def _record_arrays(self, live_np, frames, z, a):
+        """Keep, per live slot: JPEGs of the chunk's mid and last frame (agent over wrist), the Wan latent, the actions."""
+        import io
+
+        from PIL import Image
+
+        zc = None if z is None else z.detach().to(torch.float16).cpu().numpy()
+        for i in np.flatnonzero(live_np):
+            for k in (self.chunk // 2 - 1, self.chunk - 1):
+                buf = io.BytesIO()
+                Image.fromarray(np.ascontiguousarray(frames[i, k])).save(buf, format="JPEG", quality=90)
+                self.arr_jpg[i].append(buf.getvalue())
+            if zc is not None:
+                self.arr_z[i].append(zc[i])
+            self.arr_a[i].append(np.asarray(a[i], np.float32))
+
     # ------------------------------------------------------------------ dynamics
-    @torch.no_grad()
-    def chunk_step(self, policy_output_action):
+    def _real_chunk(self, a, s0, live_np, frames, states_np=None):
+        """Run the chunk in the real simulators (same actions); stop a slot at success / official violation.
+
+        With ``states_np`` (obs_source=real) also writes each executed step's render into ``frames`` (later steps
+        of a stopped slot repeat its last render) and the robot state into ``states_np``.
+        Returns (goal [B, chunk], viol_now [B], viol_step [B], succ_end [B]).
+        """
         from rlinf.envs.sim.libero.safety_auditor import audit_predicate_instances
 
-        self.onload()
-        a = policy_output_action
-        a = a.detach().float().cpu().numpy() if isinstance(a, torch.Tensor) else np.asarray(a, np.float32)
-        a = a.reshape(self.num_envs, self.chunk, -1)[..., :7].astype(np.float32)
-        frames, z = self._generate(a)
-        self.last_frames = frames                                           # [B, 8, 512, 256, 3]
-        ft = torch.from_numpy(frames).to(self.device)
-        depth = int(self._elapsed_steps[0].item()) // self.chunk
-        s0 = depth * self.chunk
-        live = ~self.ended
-        live_np = live.cpu().numpy()
-
-        # reward model on the agent view (logged; used only with reward_source == "rm")
-        # single-view RM: agent view (top 256 rows); dual-view RM: agent + wrist stacked (all 512 rows)
-        rows = 256 * int(getattr(self.reward_model, "views", 1))
-        agent = ft[:, :, :rows].reshape(-1, rows, 256, 3).permute(0, 3, 1, 2).float().div(127.5).sub(1)
-        inst = [s for s in self.task_descriptions for _ in range(self.chunk)]
-        p_succ = self.reward_model.predict_rew(agent, inst).view(self.num_envs, self.chunk)
-        self.last_p_succ = p_succ
-        hit = p_succ >= self.success_threshold
-        for _ in range(1, self.success_consecutive):
-            hit = hit[:, 1:] & hit[:, :-1]
-        rm_success = hit.any(1)
-        # in-chunk step at which the RM rule first fires (chunk = never)
-        rm_step = torch.where(rm_success, hit.float().argmax(1) + self.success_consecutive - 1,
-                              torch.full_like(rm_success, self.chunk, dtype=torch.long))
-        self.rm_success_once |= live & rm_success
-
-        # real simulator: same actions, stop at success / official violation
         goal = np.zeros((self.num_envs, self.chunk), bool)
         viol_now = np.zeros(self.num_envs, bool)
         viol_step = np.full(self.num_envs, self.chunk)  # in-chunk step of the first new violation
@@ -250,7 +403,11 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
             env = self._real[i]
             was_succ = bool(self.real_succ[i])
             for k in range(self.chunk):
-                env.step(a[i, k])
+                step_out = env.step(a[i, k])
+                if states_np is not None:  # obs_source=real: this step's render and robot state
+                    step_obs = step_out[0]
+                    frames[i, k:] = self._real_frame(step_obs)
+                    states_np[i] = self._real_state(step_obs)
                 preds = audit_predicate_instances(env)
                 official_viol = any(
                     p["source"] == "constraint" and p["value"] for p in preds
@@ -258,10 +415,22 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
                 is_goal = bool(env.check_success())
                 new_violation = official_viol and not self.real_viol[i]
                 self.real_viol[i] |= official_viol
-                if not self.real_succ[i]:  # cost window: before the first goal, the goal step included
+                in_window = self.cost_window == "episode" or not self.real_succ[i]
+                if in_window:  # goal window: before the first goal, the goal step included
                     self.c_off[i] |= official_viol
                     self.c_aux[i] |= any(p["source"] == "aux_constraint" and p["value"] for p in preds)
+                ch = None
+                if self.cost_source == "real" and self.cost_label == "grader":
+                    ch = self._grader_channels(i)
+                    self.first_viol[i][ch & (self.first_viol[i] < 0)] = s0 + k
+                    self.c_ch_ep[i] |= ch
+                    if in_window:
+                        self.c_ch[i] |= ch
                 self.last_goal[i] = is_goal
+                if self.dump_arrays:
+                    self.step_exec[i, s0 + k], self.step_goal[i, s0 + k] = True, is_goal
+                    if ch is not None:
+                        self.step_ch[i, s0 + k] = ch
                 if self.record_steps:
                     self.step_rec[i, s0 + k] = (
                         is_goal,
@@ -293,16 +462,67 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
                     self.tail_left[i] -= 1
                 if self.tail_left[i] <= 0:
                     succ_end[i], self.real_done[i] = True, True
+        return goal, viol_now, viol_step, succ_end
+
+    @torch.no_grad()
+    def chunk_step(self, policy_output_action):
+        self.onload()
+        a = policy_output_action
+        a = a.detach().float().cpu().numpy() if isinstance(a, torch.Tensor) else np.asarray(a, np.float32)
+        a = a.reshape(self.num_envs, self.chunk, -1)[..., :7].astype(np.float32)
+        if self.obs_source == "real":  # frames come from the simulator renders below; an ended slot repeats its last frame
+            frames, z = np.repeat(self.last_frame.cpu().numpy()[:, None], self.chunk, 1), None
+            states_np = self.states.cpu().numpy().copy()
+        else:
+            frames, z = self._generate(a)
+        depth = int(self._elapsed_steps[0].item()) // self.chunk
+        s0 = depth * self.chunk
+        live = ~self.ended
+        live_np = live.cpu().numpy()
+
+        # real simulator: same actions, stop at success / official violation
+        goal, viol_now, viol_step, succ_end = self._real_chunk(a, s0, live_np, frames,
+                                                               states_np if self.obs_source == "real" else None)
+        self.last_frames = frames                                           # [B, 8, 512, 256, 3]
+        ft = torch.from_numpy(frames).to(self.device)
+        if self.dump_arrays:
+            self._record_arrays(live_np, frames, z, a)
+
+        # reward model on the agent view (logged; used only with reward_source == "rm")
+        # single-view RM: agent view (top 256 rows); dual-view RM: agent + wrist stacked (all 512 rows)
+        rows = 256 * int(getattr(self.reward_model, "views", 1))
+        fidx = self.rm_frames if self.rm_frames is not None else list(range(self.chunk))
+        sub = ft[:, fidx, :rows]
+        agent = sub.reshape(-1, rows, 256, 3).permute(0, 3, 1, 2).float().div(127.5).sub(1)
+        inst = [s for s in self.task_descriptions for _ in range(len(fidx))]
+        p_sel = self.reward_model.predict_rew(agent, inst).view(self.num_envs, len(fidx))
+        p_succ = torch.zeros(self.num_envs, self.chunk, device=p_sel.device, dtype=p_sel.dtype)
+        p_succ[:, fidx] = p_sel  # unscored frames count as 0
+        self.last_p_succ = p_succ
+        self.rm_chunk_max[:, depth] = p_succ.max(1).values.float().cpu().numpy()
+        hit = p_succ >= self.success_threshold
+        for _ in range(1, self.success_consecutive):
+            hit = hit[:, 1:] & hit[:, :-1]
+        rm_success = hit.any(1)
+        # in-chunk step at which the RM rule first fires (chunk = never)
+        rm_step = torch.where(rm_success, hit.float().argmax(1) + self.success_consecutive - 1,
+                              torch.full_like(rm_success, self.chunk, dtype=torch.long))
+        self.rm_success_once |= live & rm_success
+
         self.last_real_goal = goal
 
         # cost (logged, eta-weighted as in the parent) and state read-out
-        logits = self.sam(z.to(self.device), torch.from_numpy(a).to(self.device), self.task_ids).float()
-        prob = torch.sigmoid(logits).masked_fill(~self.chmask[:, None, :], 0.0)
-        step_cost = prob.max(-1).values
-        self.step_costs[live, s0:s0 + self.chunk] = step_cost[live]
-        self.cost_by_depth[live, depth] = step_cost[live].mean(1)
+        if z is not None:  # SAM needs the Wan latent (obs_source=wan); with real observations cost_sam stays 0
+            logits = self.sam(z.to(self.device), torch.from_numpy(a).to(self.device), self.task_ids).float()
+            prob = torch.sigmoid(logits).masked_fill(~self.chmask[:, None, :], 0.0)
+            step_cost = prob.max(-1).values
+            self.step_costs[live, s0:s0 + self.chunk] = step_cost[live]
+            self.cost_by_depth[live, depth] = step_cost[live].mean(1)
         self.last_frame = ft[:, -1]
-        self.states = self.state_reader(self.last_frame) + self.state_offset
+        if self.obs_source == "real":
+            self.states = torch.from_numpy(states_np).to(self.device)
+        else:
+            self.states = self.state_reader(self.last_frame) + self.state_offset
         self._elapsed_steps = self._elapsed_steps + self.chunk
 
         if self.tail_chunks:  # a tail cut by the horizon still counts as success
@@ -342,12 +562,16 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
                 if self.reward_source == "real"
                 else self.rm_success_once
             )
+        if self.noise_fp or self.noise_fn:  # diagnostic label noise, independent of the trajectory
+            u = torch.from_numpy(self.noise_u).to(self.device)
+            reward_success = torch.where(reward_success.bool(), u >= self.noise_fn, u < self.noise_fp)
         outcome_success = end_now & reward_success & ~fail_now
         m = min(self.top_m, s0 + self.chunk)
         C = self.step_costs[:, : s0 + self.chunk].topk(m, dim=1).values.mean(1)
         C_sam = C
         if self.cost_source == "real":
-            C = torch.from_numpy(self.c_off | self.c_aux).to(self.device).float()
+            event = self.c_ch.any(1) if self.cost_label == "grader" else self.c_off | self.c_aux
+            C = torch.from_numpy(event).to(self.device).float()
         rewards = torch.zeros(self.num_envs, self.chunk, device=self.device)
         rewards[end_now, -1] = outcome_success[end_now].float() - self.eta * C[end_now]
         self.ep_cost = torch.where(end_now, C, self.ep_cost)
@@ -355,6 +579,8 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         self.returns += rewards.sum(1)
         self.ended |= end_now
         self._finished_costs.extend(C[end_now].tolist())
+        if self.dump_dir:
+            self._dump(np.flatnonzero(end_now.cpu().numpy() & ~self.dumped), outcome_success, C, C_sam, rewards)
 
         terminations = torch.zeros(self.num_envs, self.chunk, dtype=torch.bool, device=self.device)
         truncations = torch.zeros_like(terminations)
@@ -372,6 +598,11 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
             "cost_sam": C_sam.clone(),
             "cost_official": torch.from_numpy(self.c_off.copy()).to(dev).float(),
             "cost_aux": torch.from_numpy(self.c_aux.copy()).to(dev).float(),
+            **{f"cost_{c}": torch.from_numpy(self.c_ch[:, j].copy()).to(dev).float()
+               for j, c in enumerate(("obj", "robot", "grasp"))},
+            **{f"unsafe_ep_{c}": torch.from_numpy(self.c_ch_ep[:, j].copy()).to(dev).float()
+               for j, c in enumerate(("obj", "robot", "grasp"))},
+            "viol_at_reset": torch.from_numpy(self.c_ch_reset.any(1)).to(dev).float(),
             "rm_false_success": (self.rm_success_once & ~torch.from_numpy(self.real_succ.copy()).to(dev)).float(),
             **{f"cost_d{d + 1}": self.cost_by_depth[:, d].clone() for d in range(self.max_chunks)}}}
         return [self._wrap_obs()], rewards, terminations, truncations, [info]

@@ -109,6 +109,7 @@ env:
     global_eta: True
     cost_budget_factor: 0.5
     cost_source: real
+    cost_label: predicate   # E11 as run: LIBERO predicates (robot contact never fires); new runs use grader
     sync_real: True
     reward_source: real
     termination_source: horizon        # fixed 64 steps, no early end
