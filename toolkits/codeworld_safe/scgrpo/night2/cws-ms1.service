@@ -1,0 +1,16 @@
+[Unit]
+Description=CodeWorld-Safe SC-GRPO variance measurement lane 1 - /data_cf/cws_sam/v1/scgrpo/e13_pipeline.sh
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/data_cf/cws_sam/v1/scgrpo
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash /data_cf/cws_sam/v1/scgrpo/measure_pipeline.sh 1
+Restart=on-failure
+RestartSec=300
+KillMode=process
+StandardOutput=append:/data_cf/cws_sam/v1/scgrpo/causal/msnight/lane1.log
+StandardError=append:/data_cf/cws_sam/v1/scgrpo/causal/msnight/lane1.log

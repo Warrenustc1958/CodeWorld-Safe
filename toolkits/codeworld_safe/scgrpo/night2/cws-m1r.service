@@ -1,0 +1,15 @@
+[Unit]
+Description=CodeWorld-Safe item 2: M1 with real rendered observations - /data_cf/cws_sam/v1/scgrpo/m1r_pipeline.sh
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data_cf/cws_sam/v1/scgrpo
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash /data_cf/cws_sam/v1/scgrpo/m1r_pipeline.sh
+Restart=on-failure
+RestartSec=300
+KillMode=process
+StandardOutput=append:/data_cf/cws_sam/v1/scgrpo/causal/m1rnight/pipeline.log
+StandardError=append:/data_cf/cws_sam/v1/scgrpo/causal/m1rnight/pipeline.log
