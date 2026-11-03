@@ -53,6 +53,26 @@ def _restore_types(value, template):
     return value
 
 
+def _fast_merge_assets(self, other):
+    """robosuite merge_assets with the same result: append each asset of ``other`` unless an element with the same
+    (tag, name) already exists anywhere under ``self.asset``. The original runs a recursive find_elements per asset,
+    O(assets^2); building a LIBERO scene spent ~60 % of its time there (~6 s of ~10 s per env on the PPU host)."""
+    seen = {(e.tag, e.get("name")) for e in self.asset.iter()}
+    for asset in list(other.asset):
+        if (asset.tag, asset.get("name")) not in seen:
+            self.asset.append(asset)
+            seen.update((e.tag, e.get("name")) for e in asset.iter())
+
+
+def _patch_merge_assets():
+    from robosuite.models.base import MujocoXML
+    from robosuite.models.objects.objects import MujocoObject
+
+    for cls in (MujocoXML, MujocoObject):
+        if cls.__dict__.get("merge_assets") is not _fast_merge_assets:
+            cls.merge_assets = _fast_merge_assets
+
+
 class SyncRealWorldModelEnv(SafeWorldModelEnv):
     def __init__(self, cfg, *args, **kwargs):
         super().__init__(cfg, *args, **kwargs)
@@ -115,6 +135,14 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
             raise ValueError(f"Unknown obs_source: {self.obs_source}")
         if self.obs_source == "real" and self.cost_source != "real":
             raise ValueError("obs_source=real needs cost_source=real (SAM needs Wan latents)")
+        # side_render (obs_source=wan, diagnostics): the synchronised simulator also renders every executed step, so
+        # Wan and real frames are paired under the same actions; the policy still sees Wan frames. With dump_arrays
+        # each episode npz then also holds all 8 Wan frames per chunk, every real frame / state / qpos, the state
+        # reader on every Wan frame, RM scores on both, and the Wan seed of every chunk (for offline replay).
+        self.side_render = bool(cfg.get("side_render", False))
+        if self.side_render and self.obs_source != "wan":
+            raise ValueError("side_render needs obs_source=wan")
+        self._renders = self.obs_source == "real" or self.side_render
         # render_egl_remap (obs_source=real with MUJOCO_GL=egl): {worker CUDA device: EGL device index} so a worker
         # renders on another GPU (e.g. off GPUs with EGL faults). EGL indices follow eglQueryDevicesEXT, not CUDA ids.
         self.render_egl_remap = {int(k): int(v) for k, v in (cfg.get("render_egl_remap") or {}).items()}
@@ -148,6 +176,21 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
                 raise ValueError("rm_frames needs success_consecutive 1")
         if self.release_coef > 0:
             raise ValueError("SyncRealWorldModelEnv does not implement the release penalty")
+        # rm_payout (reward_source=rm): hard = 1 if the RM rule fired (threshold, original); soft = the episode's
+        # largest RM probability over the scored frames, no threshold (pair with algorithm.adv_norm: batch)
+        self.rm_payout = str(cfg.get("rm_payout", "hard"))
+        if self.rm_payout not in ("hard", "soft"):
+            raise ValueError(f"Unknown rm_payout: {self.rm_payout}")
+        if self.rm_payout == "soft" and (self.reward_source != "rm" or self.reward_rule != "once"):
+            raise ValueError("rm_payout soft needs reward_source rm and success_reward_rule once")
+        # overlap_real (obs_source=wan, no side_render): step the real simulators in a thread while Wan generates
+        # the chunk on the GPU. The real chunk only reads the actions, so the result is identical to the serial order.
+        self.overlap_real = bool(cfg.get("overlap_real", False))
+        if self.overlap_real and self._renders:
+            raise ValueError("overlap_real needs obs_source=wan and side_render off")
+        self._overlap_pool = None
+        if bool(cfg.get("fast_mjcf_merge", True)):
+            _patch_merge_assets()
         self._records = {}
         for line in open(cfg.get("episodes_jsonl", EPISODES)):
             r = json.loads(line)
@@ -157,6 +200,11 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         self._kf_t0 = meta["t0"].astype(np.int64)
         self._suites = {}
         self._pool = {}                       # (suite, task) -> idle real envs
+        # idle_env_cap: most idle real envs kept per worker (each ~0.27 GB). Without a cap the pool grows to ~8 envs per
+        # task over 40 tasks (~50 GB per worker); two 8-card runs on one host hit Ray's OOM killer (11-03).
+        # Above the cap the least recently used task's envs are closed. 0 = no cap (original behaviour).
+        self.idle_env_cap = int(cfg.get("idle_env_cap", 128))
+        self._pool_used = {}                  # (suite, task) -> reset count when the task last had a slot
         self._real = [None] * self.num_envs   # env used by each slot this episode
         self._real_key = [None] * self.num_envs
         self._raw_snaps = {}
@@ -170,13 +218,13 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         return self._suites[name]
 
     def _make_env(self, suite, task_id):
-        if self.obs_source == "real":
+        if self._renders:
             self._set_render_device()  # before LIBERO imports robosuite
         from libero.libero.envs.env_wrapper import ControlEnv
 
         s = self._suite(suite)
         task = s.get_task(task_id)
-        if self.obs_source == "real":
+        if self._renders:
             from libero.libero.envs.env_wrapper import OffScreenRenderEnv
 
             env = OffScreenRenderEnv(bddl_file_name=s.get_task_bddl_file_path(task.level, task.level_id),
@@ -251,6 +299,36 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
             snap["motion_generators"][name] = _restore_types(state, vars(generators[name]))
         _restore_simulator_state(env, snap)
         self._real[slot], self._real_key[slot] = env, key
+        if hasattr(self, "_pool_used"):
+            self._pool_used[key] = self._reset_count
+
+    def _trim_pool(self):
+        """Close idle real envs of the least recently used tasks until at most ``idle_env_cap`` are idle."""
+        cap = getattr(self, "idle_env_cap", 0)
+        idle = sum(len(v) for v in self._pool.values())
+        if cap <= 0 or idle <= cap:
+            return
+        closed = 0
+        for key in sorted((k for k, v in self._pool.items() if v), key=lambda k: self._pool_used.get(k, -1)):
+            while self._pool[key] and idle > cap:
+                env = self._pool[key].pop()
+                try:
+                    env.close()
+                except Exception:  # an env that fails to close is still dropped
+                    pass
+                idle -= 1
+                closed += 1
+            if idle <= cap:
+                break
+        if closed:
+            import ctypes
+            import gc
+
+            gc.collect()
+            try:  # hand the freed MuJoCo pages back to the OS (measured: RSS returns to baseline)
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except OSError:
+                pass
 
     def _grader_channels(self, slot):
         """[c_obj, c_robot, c_grasp] binary violations of the slot's real simulator (safety_grader, aux on)."""
@@ -278,7 +356,17 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         return np.concatenate([obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]),
                                obs["robot0_gripper_qpos"]]).astype(np.float32)
 
+    def _bind(self, slot):
+        """Make the slot's offscreen GL context current. MjRenderContext.render() does not, and every env in this
+        process has its own context: without this a slot renders its geometry with whichever context was bound last
+        (e.g. the last slot restored in reset), i.e. with another task's textures. Always reproduces under osmesa."""
+        from rlinf.envs.sim.libero.venv import _make_render_context_current, _unwrap_task_env
+
+        if hasattr(_unwrap_task_env(self._real[slot]), "sim"):  # test stubs have no simulator
+            _make_render_context_current(self._real[slot])
+
     def _real_obs_now(self, slot):
+        self._bind(slot)
         return self._real[slot].env._get_observations(force_update=True)
 
     # ------------------------------------------------------------------ reset
@@ -291,6 +379,7 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
                 self._real[slot] = None
         for slot, index in enumerate(self.kf):
             self._restore(slot, int(index))
+        self._trim_pool()
         n = self.num_envs
         self.real_succ = np.array([bool(e.check_success()) for e in self._real])
         self.real_success_at_reset = int(self.real_succ.sum())  # should be 0 for valid keyframes
@@ -329,7 +418,29 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
             self.last_frame = torch.from_numpy(np.stack([self._real_frame(x) for x in o])).to(self.device)
             self.states = torch.from_numpy(np.stack([self._real_state(x) for x in o])).to(self.device)
             obs = self._wrap_obs()
+        if self.side_render:  # per slot, index 0 = the restored keyframe state, then one entry per executed step
+            o = [self._real_obs_now(i) for i in range(n)]
+            self.side_frame = np.stack([self._real_frame(x) for x in o])  # last real render per slot
+            self.side_jpg = [[self._jpeg(self.side_frame[i])] for i in range(n)]
+            self.side_state = [[self._real_state(o[i])] for i in range(n)]
+            self.side_qpos = [[self._real_qpos(i)] for i in range(n)]
+            self.wan_jpg, self.wan_read, self.rm_real, self.rm_wan, self.wan_seed = ([[] for _ in range(n)] for _ in range(5))
         return obs, info
+
+    @staticmethod
+    def _jpeg(frame):
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.fromarray(np.ascontiguousarray(frame)).save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
+
+    def _real_qpos(self, slot):
+        from rlinf.envs.sim.libero.venv import _unwrap_task_env
+
+        return _unwrap_task_env(self._real[slot]).sim.data.qpos.astype(np.float32).copy()
 
     def _dump(self, slots, paid, C, C_sam, rewards):
         """Append one JSON line per finished episode to dump_dir/episodes_<pid>.jsonl (group = consecutive slots)."""
@@ -364,7 +475,8 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
                              jpg_off=np.cumsum([0] + [len(x) for x in jpgs]).astype(np.int64),
                              z=np.stack(self.arr_z[i]) if self.arr_z[i] else np.zeros(0, np.float16),
                              actions=np.stack(self.arr_a[i]), step_goal=self.step_goal[i],
-                             step_ch=self.step_ch[i], step_exec=self.step_exec[i])
+                             step_ch=self.step_ch[i], step_exec=self.step_exec[i],
+                             **(self._side_arrays(i) if self.side_render else {}))
                     row["arrays"] = name
                 f.write(json.dumps(row) + "\n")
                 self.dumped[i] = True
@@ -385,6 +497,36 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
                 self.arr_z[i].append(zc[i])
             self.arr_a[i].append(np.asarray(a[i], np.float32))
 
+    def _record_side(self, live_np, frames, ft, fidx, rows, inst, p_sel):
+        """side_render: per live slot keep all 8 Wan frames, the state reader on each, the RM on the paired real
+        frames (same rm_frames as the Wan RM), and this chunk's Wan seed (as computed in ``_generate``)."""
+        seed = (self.seed * 1_000_003 + self._batch_counter) % (2 ** 31)
+        real = torch.from_numpy(self.side_chunk).to(self.device)
+        sub = real[:, fidx, :rows]
+        x = sub.reshape(-1, rows, 256, 3).permute(0, 3, 1, 2).float().div(127.5).sub(1)
+        p_real = self.reward_model.predict_rew(x, inst).view(self.num_envs, len(fidx)).float().cpu().numpy()
+        read = self.state_reader(ft.reshape(-1, *ft.shape[2:])).view(self.num_envs, self.chunk, -1)
+        read = (read + self.state_offset[:, None]).float().cpu().numpy()
+        p_wan = p_sel.float().cpu().numpy()
+        for i in np.flatnonzero(live_np):
+            self.rm_wan[i].append(p_wan[i])
+            self.wan_jpg[i].extend(self._jpeg(frames[i, k]) for k in range(self.chunk))
+            self.wan_read[i].append(read[i])
+            self.rm_real[i].append(p_real[i])
+            self.wan_seed[i].append(seed)
+
+    def _side_arrays(self, i):
+        jr, jw = self.side_jpg[i], self.wan_jpg[i]
+        return dict(
+            real_jpg=np.frombuffer(b"".join(jr), np.uint8), real_off=np.cumsum([0] + [len(x) for x in jr]),
+            wan_jpg=np.frombuffer(b"".join(jw), np.uint8), wan_off=np.cumsum([0] + [len(x) for x in jw]),
+            real_state=np.stack(self.side_state[i]), real_qpos=np.stack(self.side_qpos[i]),
+            wan_read=np.concatenate(self.wan_read[i]) if self.wan_read[i] else np.zeros((0, 8), np.float32),
+            rm_real=np.stack(self.rm_real[i]) if self.rm_real[i] else np.zeros((0, 0), np.float32),
+            rm_wan=np.stack(self.rm_wan[i]) if self.rm_wan[i] else np.zeros((0, 0), np.float32),
+            wan_seed=np.asarray(self.wan_seed[i], np.int64), kf=int(self.kf[i]),
+            slot_in_batch=int(i), batch_size=int(self.num_envs))
+
     # ------------------------------------------------------------------ dynamics
     def _real_chunk(self, a, s0, live_np, frames, states_np=None):
         """Run the chunk in the real simulators (same actions); stop a slot at success / official violation.
@@ -403,11 +545,20 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
             env = self._real[i]
             was_succ = bool(self.real_succ[i])
             for k in range(self.chunk):
+                if self._renders:  # step() renders the observation: bind this slot's context first
+                    self._bind(i)
                 step_out = env.step(a[i, k])
                 if states_np is not None:  # obs_source=real: this step's render and robot state
                     step_obs = step_out[0]
                     frames[i, k:] = self._real_frame(step_obs)
                     states_np[i] = self._real_state(step_obs)
+                if self.side_render:  # paired real render, kept apart from the Wan frames the policy sees
+                    step_obs = step_out[0]
+                    self.side_frame[i] = self._real_frame(step_obs)
+                    self.side_chunk[i, k:] = self.side_frame[i]
+                    self.side_jpg[i].append(self._jpeg(self.side_frame[i]))
+                    self.side_state[i].append(self._real_state(step_obs))
+                    self.side_qpos[i].append(self._real_qpos(i))
                 preds = audit_predicate_instances(env)
                 official_viol = any(
                     p["source"] == "constraint" and p["value"] for p in preds
@@ -470,19 +621,31 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         a = policy_output_action
         a = a.detach().float().cpu().numpy() if isinstance(a, torch.Tensor) else np.asarray(a, np.float32)
         a = a.reshape(self.num_envs, self.chunk, -1)[..., :7].astype(np.float32)
-        if self.obs_source == "real":  # frames come from the simulator renders below; an ended slot repeats its last frame
-            frames, z = np.repeat(self.last_frame.cpu().numpy()[:, None], self.chunk, 1), None
-            states_np = self.states.cpu().numpy().copy()
-        else:
-            frames, z = self._generate(a)
         depth = int(self._elapsed_steps[0].item()) // self.chunk
         s0 = depth * self.chunk
         live = ~self.ended
         live_np = live.cpu().numpy()
+        real_job = None
+        if self.obs_source == "real":  # frames come from the simulator renders below; an ended slot repeats its last frame
+            frames, z = np.repeat(self.last_frame.cpu().numpy()[:, None], self.chunk, 1), None
+            states_np = self.states.cpu().numpy().copy()
+        else:
+            if getattr(self, "overlap_real", False):  # physics on the CPU while Wan runs; the real chunk needs only the actions
+                if getattr(self, "_overlap_pool", None) is None:
+                    from concurrent.futures import ThreadPoolExecutor
+
+                    self._overlap_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="real_chunk")
+                real_job = self._overlap_pool.submit(self._real_chunk, a, s0, live_np, None, None)
+            frames, z = self._generate(a)
+        if self.side_render:  # a slot that stops inside the chunk repeats its last real render
+            self.side_chunk = np.repeat(self.side_frame[:, None], self.chunk, 1)
 
         # real simulator: same actions, stop at success / official violation
-        goal, viol_now, viol_step, succ_end = self._real_chunk(a, s0, live_np, frames,
-                                                               states_np if self.obs_source == "real" else None)
+        if real_job is not None:
+            goal, viol_now, viol_step, succ_end = real_job.result()
+        else:
+            goal, viol_now, viol_step, succ_end = self._real_chunk(a, s0, live_np, frames,
+                                                                   states_np if self.obs_source == "real" else None)
         self.last_frames = frames                                           # [B, 8, 512, 256, 3]
         ft = torch.from_numpy(frames).to(self.device)
         if self.dump_arrays:
@@ -508,6 +671,8 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
         rm_step = torch.where(rm_success, hit.float().argmax(1) + self.success_consecutive - 1,
                               torch.full_like(rm_success, self.chunk, dtype=torch.long))
         self.rm_success_once |= live & rm_success
+        if self.side_render:
+            self._record_side(live_np, frames, ft, fidx, rows, inst, p_sel)
 
         self.last_real_goal = goal
 
@@ -566,6 +731,10 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
             u = torch.from_numpy(self.noise_u).to(self.device)
             reward_success = torch.where(reward_success.bool(), u >= self.noise_fn, u < self.noise_fp)
         outcome_success = end_now & reward_success & ~fail_now
+        paid = outcome_success.float()
+        if getattr(self, "rm_payout", "hard") == "soft":  # largest RM probability so far in the episode (scored frames)
+            p_max = torch.from_numpy(np.nan_to_num(self.rm_chunk_max[:, : depth + 1], nan=0.0).max(1)).to(self.device)
+            paid = torch.where(end_now & ~fail_now, p_max.float(), torch.zeros_like(p_max, dtype=torch.float32))
         m = min(self.top_m, s0 + self.chunk)
         C = self.step_costs[:, : s0 + self.chunk].topk(m, dim=1).values.mean(1)
         C_sam = C
@@ -573,7 +742,7 @@ class SyncRealWorldModelEnv(SafeWorldModelEnv):
             event = self.c_ch.any(1) if self.cost_label == "grader" else self.c_off | self.c_aux
             C = torch.from_numpy(event).to(self.device).float()
         rewards = torch.zeros(self.num_envs, self.chunk, device=self.device)
-        rewards[end_now, -1] = outcome_success[end_now].float() - self.eta * C[end_now]
+        rewards[end_now, -1] = paid[end_now] - self.eta * C[end_now]
         self.ep_cost = torch.where(end_now, C, self.ep_cost)
         self.success_once |= outcome_success
         self.returns += rewards.sum(1)

@@ -116,7 +116,17 @@ def compute_grpo_advantages(
     advantages = grouped_rewards - grouped_reward_mean
     # adv_std_floor > 0 keeps near-constant groups (std ~1e-5) from being blown up to unit scale
     std_floor = float(kwargs.get("adv_std_floor") or 0.0)
-    if std_floor > 0:
+    # adv_norm: group = divide by each group's std (GRPO); batch = divide every group by one std of the
+    # group-centered rewards over the whole batch, so a near-constant group stays near zero instead of being
+    # rescaled to unit size (soft RM payouts: the RM's within-group noise is not amplified); none = centered only
+    adv_norm = str(kwargs.get("adv_norm") or "group")
+    if adv_norm == "batch":
+        advantages = advantages / advantages.std().clamp(min=max(std_floor, 1e-6))
+    elif adv_norm == "none":
+        pass
+    elif adv_norm != "group":
+        raise ValueError(f"Unknown adv_norm: {adv_norm}")
+    elif std_floor > 0:
         advantages = advantages / grouped_reward_std.clamp(min=std_floor)
     else:
         advantages = advantages / (grouped_reward_std + 1e-6)

@@ -73,6 +73,8 @@ def _make_env(monkeypatch, *, reward_source, termination_source, rm_probs, real_
     env.top_m, env.eta = 8, eta
     env.cost_source, env.cost_label, env.cost_window = cost_source, cost_label, cost_window
     env.obs_source = obs_source
+    env.side_render, env._renders = False, obs_source == "real"
+    env.rm_payout, env.overlap_real = "hard", False
     env.noise_fp = env.noise_fn = 0.0
     env.dump_dir, env._reset_count, env.group_size = None, 1, 1
     env.dump_arrays = False
@@ -170,6 +172,24 @@ def test_rm_reward_rule_transient_false_hit(monkeypatch, reward_rule, expected_r
     assert r1.sum().item() == 0.0 and not t1[0, -1]
     assert t2[0, -1]
     assert r2[0, -1].item() == expected_reward
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_rm_soft_payout_is_episode_max_probability(monkeypatch, overlap):
+    # no frame crosses the 0.8 threshold: hard pays 0, soft pays the largest RM probability (0.6, chunk 1)
+    rm = [torch.tensor([.1, .2, .6, .3, .1, .1, .1, .1]), torch.full((8,), 0.4)]
+    env = _make_env(monkeypatch, reward_source="rm", termination_source="horizon", rm_probs=list(rm),
+                    real_env=_RealEnv(goal_at=None), max_chunks=2, tail_chunks=2, outcome_order="step")
+    env.rm_payout, env.overlap_real = "soft", overlap
+    _, r1, _, t1, _ = env.chunk_step(torch.zeros(1, 8, 7))
+    _, r2, _, t2, info = env.chunk_step(torch.zeros(1, 8, 7))
+    assert r1.sum().item() == 0.0 and not t1[0, -1] and t2[0, -1]
+    assert r2[0, -1].item() == pytest.approx(0.6)
+    assert info[0]["episode"]["success_once"].item() == 0  # the logged hard outcome is unchanged
+    hard = _make_env(monkeypatch, reward_source="rm", termination_source="horizon", rm_probs=list(rm),
+                     real_env=_RealEnv(goal_at=None), max_chunks=2, tail_chunks=2, outcome_order="step")
+    hard.chunk_step(torch.zeros(1, 8, 7))
+    assert hard.chunk_step(torch.zeros(1, 8, 7))[1][0, -1].item() == 0.0
 
 
 @pytest.mark.parametrize(("reward_rule", "expected_reward"), [("once", 1.0), ("final", 0.0)])
